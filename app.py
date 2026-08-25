@@ -44,7 +44,17 @@ def init():
         account_name TEXT DEFAULT '',
         note TEXT DEFAULT ''
     );
-    """)
+    CREATE TABLE IF NOT EXISTS qr_ranges(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    min_amount INTEGER NOT NULL,
+    max_amount INTEGER NOT NULL,
+    upi_id TEXT DEFAULT '',
+    qr_url TEXT DEFAULT '',
+    account_name TEXT DEFAULT '',
+    note TEXT DEFAULT '',
+    enabled INTEGER DEFAULT 1
+);
+""")
     if con.execute("SELECT COUNT(*) c FROM games").fetchone()["c"]==0:
         con.executemany("INSERT INTO games(name) VALUES(?)",
                        [("Aviator Demo",),("Slots Demo",),("Lucky Gems Demo",)])
@@ -196,7 +206,43 @@ def payments():
     account=cfg["account_name"] if cfg else ""
     note=cfg["note"] if cfg else ""
 
-    qr_card=f"""<div class=card>
+    rangecon=db()
+    range_rows=rangecon.execute(
+        "SELECT id,min_amount,max_amount,upi_id,qr_url,account_name,note,enabled FROM qr_ranges ORDER BY min_amount"
+    ).fetchall()
+    rangecon.close()
+
+    range_cards="""<div class=card><h3>Demo QR Amount Ranges</h3>"""
+
+    for rr in range_rows:
+        state="Enabled" if rr["enabled"] else "Disabled"
+        checked="checked" if rr["enabled"] else ""
+
+        range_cards+=f"""<div style="padding:12px;margin:10px 0;background:#0b1728;border-radius:8px">
+        <b>₹{rr["min_amount"]} - ₹{rr["max_amount"]}</b>
+        <p>Status: {state}</p>
+
+        <form method=post action="/demo-qr-range/{rr['id']}" enctype="multipart/form-data">
+        <input name=account_name placeholder="Demo Account Name" value="{rr['account_name'] or ''}">
+        <input name=upi_id placeholder="Demo UPI ID" value="{rr['upi_id'] or ''}">
+        <input name=note placeholder="Demo Note" value="{rr['note'] or ''}">
+        <input type=file name=qr_file accept="image/png,image/jpeg,image/webp">
+        <input type=hidden name=old_qr value="{rr['qr_url'] or ''}">
+        <label>
+        <input type=checkbox name=enabled value=1 {checked}> Enabled
+        </label>
+        <button>Save Demo Range</button>
+        </form>"""
+
+        if rr["qr_url"]:
+            range_cards+=f"""<br>
+            <img src="{rr['qr_url']}" style="max-width:160px;border-radius:8px">"""
+
+        range_cards+="</div>"
+
+    range_cards+="</div>"
+
+    qr_card=range_cards+f"""<div class=card>
     <h3>QR Payment Settings</h3>
     <form method=post action="/payment-settings" enctype="multipart/form-data">
     <input name=account_name placeholder="Account Name" value="{account}">
@@ -244,6 +290,36 @@ def save_payment_settings():
     )
     con.commit()
     con.close()
+    return redirect("/payments")
+
+@app.route("/demo-qr-range/<int:range_id>",methods=["POST"])
+def save_demo_qr_range(range_id):
+    if not auth():
+        return redirect("/login")
+
+    qr=request.form.get("old_qr","").strip()
+
+    f=request.files.get("qr_file")
+    if f and f.filename:
+        qr="data:"+f.mimetype+";base64,"+base64.b64encode(f.read()).decode("ascii")
+
+    con=db()
+    con.execute(
+        """UPDATE qr_ranges
+        SET upi_id=?,qr_url=?,account_name=?,note=?,enabled=?
+        WHERE id=?""",
+        (
+            request.form.get("upi_id","").strip(),
+            qr,
+            request.form.get("account_name","").strip(),
+            request.form.get("note","").strip(),
+            1 if request.form.get("enabled")=="1" else 0,
+            range_id
+        )
+    )
+    con.commit()
+    con.close()
+
     return redirect("/payments")
 
 @app.route("/payment/<int:i>/approve")

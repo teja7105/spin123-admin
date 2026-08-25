@@ -741,3 +741,21 @@ def api_admin_reject_money_request(req_id):
 
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=8080)
+
+@app.route("/api/payment-settings", methods=["GET"])
+def api_payment_settings():
+    con = db()
+    row = con.execute(
+        "SELECT upi_id, qr_url, account_name, note FROM payment_settings WHERE id=1"
+    ).fetchone()
+    con.close()
+
+    if not row:
+        return jsonify({
+            "upi_id": "",
+            "qr_url": "",
+            "account_name": "",
+            "note": ""
+        })
+
+    return jsonify(dict(row))

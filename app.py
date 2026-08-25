@@ -36,6 +36,13 @@ def init():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       message TEXT
     );
+    CREATE TABLE IF NOT EXISTS payment_settings(
+        id INTEGER PRIMARY KEY,
+        upi_id TEXT DEFAULT '',
+        qr_url TEXT DEFAULT '',
+        account_name TEXT DEFAULT '',
+        note TEXT DEFAULT ''
+    );
     """)
     if con.execute("SELECT COUNT(*) c FROM games").fetchone()["c"]==0:
         con.executemany("INSERT INTO games(name) VALUES(?)",
@@ -179,7 +186,42 @@ def payments():
         con.commit()
     rows=con.execute("SELECT * FROM payments ORDER BY id DESC").fetchall()
     con.close()
-    html="""<div class=card><h3>Demo Payment Request</h3>
+    cfgcon=db()
+    cfg=cfgcon.execute("SELECT upi_id,qr_url,account_name,note FROM payment_settings WHERE id=1").fetchone()
+    cfgcon.close()
+
+    upi=cfg["upi_id"] if cfg else ""
+    qr=cfg["qr_url"] if cfg else ""
+    account=cfg["account_name"] if cfg else ""
+    note=cfg["note"] if cfg else ""
+
+    qr_card=f"""<div class=card>
+    <h3>QR Payment Settings</h3>
+    <form method=post action="/payment-settings">
+    <input name=account_name placeholder="Account Name" value="{account}">
+    <input name=upi_id placeholder="UPI ID" value="{upi}">
+    <input name=qr_url placeholder="QR Image URL" value="{qr}">
+    <input name=note placeholder="Payment Note" value="{note}">
+    <button>Save QR Settings</button>
+    </form>"""
+    if qr:
+        qr_card+=f"""<br><img src="{qr}" style="max-width:220px">
+        <p><b>UPI ID:</b> {upi}</p>"""
+    qr_card+="</div>"
+
+    cfg=db().execute("SELECT upi_id,qr_url,account_name,note FROM payment_settings WHERE id=1").fetchone()
+    upi=cfg["upi_id"] if cfg else ""
+    qr=cfg["qr_url"] if cfg else ""
+    account=cfg["account_name"] if cfg else ""
+    note=cfg["note"] if cfg else ""
+    qr_card=f"""<div class=card><h3>QR Payment Settings</h3>
+<form method=post action="/payment-settings">
+<input name=account_name placeholder="Account Name" value="{account}">
+<input name=upi_id placeholder="UPI ID" value="{upi}">
+<input name=qr_url placeholder="QR Image URL" value="{qr}">
+<input name=note placeholder="Payment Note" value="{note}">
+<button>Save QR Settings</button></form></div>"""
+    html=qr_card+"""<div class=card><h3>Demo Payment Requests</h3>
     <form method=post>
     <input name=player placeholder="Player" required>
     <select name=type><option>Deposit Demo</option><option>Withdrawal Demo</option><option>Refund Demo</option></select>
@@ -189,6 +231,44 @@ def payments():
     for r in rows:
         html+=f"<tr><td>{r['player']}</td><td>{r['type']}</td><td>{r['amount']}</td><td>{r['status']}</td><td><a href='/payment/{r['id']}/approve'><button>Approve Demo</button></a></td></tr>"
     return page(html+"</table>")
+
+@app.route("/payment-settings",methods=["POST"])
+def save_payment_settings():
+    if not auth():
+        return redirect("/login")
+    con=db()
+    con.execute(
+        """INSERT OR REPLACE INTO payment_settings
+        (id,upi_id,qr_url,account_name,note)
+        VALUES(1,?,?,?,?)""",
+        (
+            request.form.get("upi_id","").strip(),
+            request.form.get("qr_url","").strip(),
+            request.form.get("account_name","").strip(),
+            request.form.get("note","").strip()
+        )
+    )
+    con.commit()
+    con.close()
+    return redirect("/payments")
+
+@app.route("/payment-settings",methods=["POST"])
+def save_payment_settings():
+    if not auth():
+        return redirect("/login")
+    con=db()
+    con.execute(
+        "INSERT OR REPLACE INTO payment_settings(id,upi_id,qr_url,account_name,note) VALUES(1,?,?,?,?)",
+        (
+            request.form.get("upi_id","").strip(),
+            request.form.get("qr_url","").strip(),
+            request.form.get("account_name","").strip(),
+            request.form.get("note","").strip()
+        )
+    )
+    con.commit()
+    con.close()
+    return redirect("/payments")
 
 @app.route("/payment/<int:i>/approve")
 def approve(i):

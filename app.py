@@ -209,18 +209,6 @@ def payments():
         <p><b>UPI ID:</b> {upi}</p>"""
     qr_card+="</div>"
 
-    cfg=db().execute("SELECT upi_id,qr_url,account_name,note FROM payment_settings WHERE id=1").fetchone()
-    upi=cfg["upi_id"] if cfg else ""
-    qr=cfg["qr_url"] if cfg else ""
-    account=cfg["account_name"] if cfg else ""
-    note=cfg["note"] if cfg else ""
-    qr_card=f"""<div class=card><h3>QR Payment Settings</h3>
-<form method=post action="/payment-settings">
-<input name=account_name placeholder="Account Name" value="{account}">
-<input name=upi_id placeholder="UPI ID" value="{upi}">
-<input name=qr_url placeholder="QR Image URL" value="{qr}">
-<input name=note placeholder="Payment Note" value="{note}">
-<button>Save QR Settings</button></form></div>"""
     html=qr_card+"""<div class=card><h3>Demo Payment Requests</h3>
     <form method=post>
     <input name=player placeholder="Player" required>
@@ -241,24 +229,6 @@ def save_payment_settings():
         """INSERT OR REPLACE INTO payment_settings
         (id,upi_id,qr_url,account_name,note)
         VALUES(1,?,?,?,?)""",
-        (
-            request.form.get("upi_id","").strip(),
-            request.form.get("qr_url","").strip(),
-            request.form.get("account_name","").strip(),
-            request.form.get("note","").strip()
-        )
-    )
-    con.commit()
-    con.close()
-    return redirect("/payments")
-
-@app.route("/payment-settings",methods=["POST"])
-def save_payment_settings():
-    if not auth():
-        return redirect("/login")
-    con=db()
-    con.execute(
-        "INSERT OR REPLACE INTO payment_settings(id,upi_id,qr_url,account_name,note) VALUES(1,?,?,?,?)",
         (
             request.form.get("upi_id","").strip(),
             request.form.get("qr_url","").strip(),

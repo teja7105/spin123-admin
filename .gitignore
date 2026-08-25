@@ -1,0 +1,8 @@
+admin.db
+admin.db.*
+__pycache__/
+*.pyc
+
+*.backup
+*.backup*
+server.log

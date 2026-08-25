@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Spin Admin Panel</title>
+<style>
+body{margin:0;font-family:Arial;background:#07111f;color:white}
+.login{max-width:360px;margin:100px auto;background:#101d30;padding:30px;border-radius:18px}
+input,button{box-sizing:border-box;width:100%;padding:14px;margin:8px 0;border:0;border-radius:10px}
+button{background:#18c98b;color:white;font-weight:bold}
+#panel{display:none}
+header{background:#101d30;padding:18px;font-size:22px;font-weight:bold}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;padding:16px}
+.card{background:#101d30;padding:20px;border-radius:14px}
+.card b{font-size:25px;display:block;margin-top:8px}
+.menu{padding:16px}
+.menu button{text-align:left;background:#16263d}
+</style>
+</head>
+<body>
+
+<div id="login" class="login">
+<h2>SPIN ADMIN</h2>
+<p>Admin Login</p>
+<input id="user" placeholder="Username">
+<input id="pass" type="password" placeholder="Password">
+<button onclick="login()">LOGIN</button>
+<p id="error"></p>
+</div>
+
+<div id="panel">
+<header>SPIN ADMIN PANEL</header>
+
+<div class="grid">
+<div class="card">Players<b>0</b></div>
+<div class="card">Games<b>0</b></div>
+<div class="card">Online<b>0</b></div>
+<div class="card">Requests<b>0</b></div>
+</div>
+
+<div class="menu">
+<button>👤 Player Management</button>
+<button>🎮 Game Management</button>
+<button>👑 VIP Management</button>
+<button>🔔 Notifications</button>
+<button>💬 Customer Support</button>
+<button>📜 Activity History</button>
+<button>⚙️ Settings</button>
+</div>
+</div>
+
+<script>
+function login(){
+ if(user.value==="admin" && pass.value==="123456"){
+  document.getElementById("login").style.display="none";
+  document.getElementById("panel").style.display="block";
+ }else{
+  document.getElementById("error").innerText="Wrong username or password";
+ }
+}
+</script>
+</body>
+</html>

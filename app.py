@@ -58,6 +58,26 @@ def init():
     if con.execute("SELECT COUNT(*) c FROM games").fetchone()["c"]==0:
         con.executemany("INSERT INTO games(name) VALUES(?)",
                        [("Aviator Demo",),("Slots Demo",),("Lucky Gems Demo",)])
+    # Seed demo QR ranges if empty
+    count = con.execute("SELECT COUNT(*) FROM qr_ranges").fetchone()[0]
+    if count == 0:
+        ranges = [
+            (1,100),
+            (101,500),
+            (501,1000),
+            (1001,2000),
+            (2001,3000),
+            (3001,5000),
+            (5001,10000),
+            (10001,100000)
+        ]
+        con.executemany(
+            """INSERT INTO qr_ranges
+            (min_amount,max_amount,account_name,note,enabled)
+            VALUES(?,?,?, ?,1)""",
+            [(a,b,"DEMO ACCOUNT","DEMO ONLY") for a,b in ranges]
+        )
+
     con.commit()
     con.close()
 

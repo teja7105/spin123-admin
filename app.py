@@ -1,3 +1,4 @@
+import base64
 from flask import Flask, request, redirect, session, render_template_string
 import sqlite3, os
 
@@ -197,10 +198,10 @@ def payments():
 
     qr_card=f"""<div class=card>
     <h3>QR Payment Settings</h3>
-    <form method=post action="/payment-settings">
+    <form method=post action="/payment-settings" enctype="multipart/form-data">
     <input name=account_name placeholder="Account Name" value="{account}">
     <input name=upi_id placeholder="UPI ID" value="{upi}">
-    <input name=qr_url placeholder="QR Image URL" value="{qr}">
+    <input type=file name=qr_file accept="image/png,image/jpeg,image/webp">\n    <input type=hidden name=old_qr value="{qr}">
     <input name=note placeholder="Payment Note" value="{note}">
     <button>Save QR Settings</button>
     </form>"""
@@ -231,7 +232,12 @@ def save_payment_settings():
         VALUES(1,?,?,?,?)""",
         (
             request.form.get("upi_id","").strip(),
-            request.form.get("qr_url","").strip(),
+            (
+            "data:" + request.files["qr_file"].mimetype + ";base64," +
+            base64.b64encode(request.files["qr_file"].read()).decode("ascii")
+            if request.files.get("qr_file") and request.files["qr_file"].filename
+            else request.form.get("old_qr","").strip()
+        ),
             request.form.get("account_name","").strip(),
             request.form.get("note","").strip()
         )

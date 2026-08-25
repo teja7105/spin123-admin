@@ -3,7 +3,7 @@ from flask import Flask, request, redirect, session, render_template_string
 import sqlite3, os
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY","change-this-secret-key")
+app.secret_key = os.environ.get("SECRET_KEY","change-this-demo-key")
 DB="admin.db"
 
 def db():
@@ -54,47 +54,10 @@ def init():
     note TEXT DEFAULT '',
     enabled INTEGER DEFAULT 1
 );
-    CREATE TABLE IF NOT EXISTS platform_wallet(
-      id INTEGER PRIMARY KEY CHECK(id=1),
-      balance REAL NOT NULL DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS admin_settlements(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      amount REAL NOT NULL,
-      account_holder TEXT NOT NULL,
-      account_number TEXT NOT NULL,
-      ifsc TEXT NOT NULL,
-      bank_name TEXT DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'Pending',
-      reference TEXT DEFAULT '',
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
 """)
-    con.execute("INSERT OR IGNORE INTO platform_wallet(id,balance) VALUES(1,0)")
-
     if con.execute("SELECT COUNT(*) c FROM games").fetchone()["c"]==0:
         con.executemany("INSERT INTO games(name) VALUES(?)",
-                       [("Aviator",),("Slots",),("Lucky Gems Demo",)])
-    # Seed QR ranges if empty
-    count = con.execute("SELECT COUNT(*) FROM qr_ranges").fetchone()[0]
-    if count == 0:
-        ranges = [
-            (1,100),
-            (101,500),
-            (501,1000),
-            (1001,2000),
-            (2001,3000),
-            (3001,5000),
-            (5001,10000),
-            (10001,100000)
-        ]
-        con.executemany(
-            """INSERT INTO qr_ranges
-            (min_amount,max_amount,account_name,note,enabled)
-            VALUES(?,?,?, ?,1)""",
-            [(a,b,"","") for a,b in ranges]
-        )
-
+                       [("Aviator Demo",),("Slots Demo",),("Lucky Gems Demo",)])
     con.commit()
     con.close()
 
@@ -126,7 +89,7 @@ td,th{padding:10px;border-bottom:1px solid #24364d;text-align:left}
 <a href="/">Dashboard</a>
 <a href="/players">Players</a>
 <a href="/games">Games</a>
-<a href="/payments">Payments</a><a href="/finance">Finance</a>
+<a href="/payments">Payments Demo</a>
 <a href="/notifications">Notifications</a>
 <a href="/support">Support</a>
 <a href="/history">History</a>
@@ -146,7 +109,7 @@ def auth():
 @app.route("/login",methods=["GET","POST"])
 def login():
     if request.method=="POST":
-        if request.form.get("user")==os.environ.get("SPIN123_ADMIN_USER","admin") and request.form.get("pass")==os.environ.get("ADMIN_PASSWORD","123456"):
+        if request.form.get("user")=="admin" and request.form.get("pass")==os.environ.get("ADMIN_PASSWORD","123456"):
             session["admin"]=1
             return redirect("/")
         return page("<div class=card>Wrong username or password</div>")
@@ -180,7 +143,7 @@ def home():
     <div class=card>Online<h2>0</h2></div>
     <div class=card>Pending Requests<h2>{pay}</h2></div>
     </div>
-    <div class=card><b>Backend connected ✅</b><br>SQLite database active</div>
+    <div class=card><b>Demo backend connected ✅</b><br>SQLite database active</div>
     """)
 
 @app.route("/players",methods=["GET","POST"])
@@ -245,38 +208,17 @@ def payments():
 
     rangecon=db()
     range_rows=rangecon.execute(
-        "SELECT id,min_amount,max_amount,upi_id,qr_url,account_name,note,enabled FROM qr_ranges ORDER BY min_amount"
+        "SELECT id,min_amount,max_amount,enabled FROM qr_ranges ORDER BY min_amount"
     ).fetchall()
     rangecon.close()
 
-    range_cards="""<div class=card><h3>QR Amount Ranges</h3>"""
-
+    range_cards="""<div class=card><h3>Demo QR Amount Ranges</h3>"""
     for rr in range_rows:
         state="Enabled" if rr["enabled"] else "Disabled"
-        checked="checked" if rr["enabled"] else ""
-
-        range_cards+=f"""<div style="padding:12px;margin:10px 0;background:#0b1728;border-radius:8px">
+        range_cards+=f"""<div style="padding:10px;margin:8px 0;background:#0b1728;border-radius:8px">
         <b>₹{rr["min_amount"]} - ₹{rr["max_amount"]}</b>
-        <p>Status: {state}</p>
-
-        <form method=post action="/qr-range/{rr['id']}" enctype="multipart/form-data">
-        <input name=account_name placeholder="Account Name" value="{rr['account_name'] or ''}">
-        <input name=upi_id placeholder="UPI ID" value="{rr['upi_id'] or ''}">
-        <input name=note placeholder="Note" value="{rr['note'] or ''}">
-        <input type=file name=qr_file accept="image/png,image/jpeg,image/webp">
-        <input type=hidden name=old_qr value="{rr['qr_url'] or ''}">
-        <label>
-        <input type=checkbox name=enabled value=1 {checked}> Enabled
-        </label>
-        <button>Save Range</button>
-        </form>"""
-
-        if rr["qr_url"]:
-            range_cards+=f"""<br>
-            <img src="{rr['qr_url']}" style="max-width:160px;border-radius:8px">"""
-
-        range_cards+="</div>"
-
+        &nbsp; <span>{state}</span>
+        </div>"""
     range_cards+="</div>"
 
     qr_card=range_cards+f"""<div class=card>
@@ -293,57 +235,15 @@ def payments():
         <p><b>UPI ID:</b> {upi}</p>"""
     qr_card+="</div>"
 
-    html=qr_card+"""
-<div class=card>
-<h3>Temporary Unlimited Withdrawal</h3>
-<p>Time खत्म होने पर 80% withdrawal rule अपने आप वापस लागू होगा.</p>
-
-<button onclick="setUnlimited(30)">30 Min</button>
-<button onclick="setUnlimited(60)">1 Hour</button>
-<button onclick="setUnlimited(120)">2 Hours</button>
-<button onclick="setUnlimited(0)">OFF</button>
-
-<p id="unlimitedStatus">Status loading...</p>
-
-<script>
-async function setUnlimited(minutes){
-    const key = prompt("Admin API Key");
-    if(!key) return;
-
-    const r = await fetch("/api/admin/withdrawal-unlimited",{
-        method:"POST",
-        headers:{
-            "Content-Type":"application/json",
-            "X-Admin-Key":key
-        },
-        body:JSON.stringify({minutes:minutes})
-    });
-
-    const j = await r.json();
-
-    if(!j.ok){
-        alert(j.error || "Request failed");
-        return;
-    }
-
-    if(j.unlimited){
-        document.getElementById("unlimitedStatus").innerText =
-            "Unlimited until: " + j.unlimited_until;
-    }else{
-        document.getElementById("unlimitedStatus").innerText =
-            "OFF - 80% rule active";
-    }
-}
-</script>
-<div class=card><h3>Payment Requests</h3>
+    html=qr_card+"""<div class=card><h3>Demo Payment Requests</h3>
     <form method=post>
     <input name=player placeholder="Player" required>
-    <select name=type><option>Deposit</option><option>Withdrawal Demo</option><option>Refund Demo</option></select>
+    <select name=type><option>Deposit Demo</option><option>Withdrawal Demo</option><option>Refund Demo</option></select>
     <input name=amount type=number placeholder="Amount" required>
     <button>Create Request</button></form></div>
     <table><tr><th>Player</th><th>Type</th><th>Amount</th><th>Status</th><th>Action</th></tr>"""
     for r in rows:
-        html+=f"<tr><td>{r['player']}</td><td>{r['type']}</td><td>{r['amount']}</td><td>{r['status']}</td><td><a href='/payment/{r['id']}/approve'><button>Approve</button></a></td></tr>"
+        html+=f"<tr><td>{r['player']}</td><td>{r['type']}</td><td>{r['amount']}</td><td>{r['status']}</td><td><a href='/payment/{r['id']}/approve'><button>Approve Demo</button></a></td></tr>"
     return page(html+"</table>")
 
 @app.route("/payment-settings",methods=["POST"])
@@ -371,41 +271,11 @@ def save_payment_settings():
     con.close()
     return redirect("/payments")
 
-@app.route("/qr-range/<int:range_id>",methods=["POST"])
-def save_qr_range(range_id):
-    if not auth():
-        return redirect("/login")
-
-    qr=request.form.get("old_qr","").strip()
-
-    f=request.files.get("qr_file")
-    if f and f.filename:
-        qr="data:"+f.mimetype+";base64,"+base64.b64encode(f.read()).decode("ascii")
-
-    con=db()
-    con.execute(
-        """UPDATE qr_ranges
-        SET upi_id=?,qr_url=?,account_name=?,note=?,enabled=?
-        WHERE id=?""",
-        (
-            request.form.get("upi_id","").strip(),
-            qr,
-            request.form.get("account_name","").strip(),
-            request.form.get("note","").strip(),
-            1 if request.form.get("enabled")=="1" else 0,
-            range_id
-        )
-    )
-    con.commit()
-    con.close()
-
-    return redirect("/payments")
-
 @app.route("/payment/<int:i>/approve")
 def approve(i):
     if not auth(): return redirect("/login")
     con=db()
-    con.execute("UPDATE payments SET status='Approved' WHERE id=?",(i,))
+    con.execute("UPDATE payments SET status='Approved Demo' WHERE id=?",(i,))
     con.commit(); con.close()
     return redirect("/payments")
 
@@ -678,68 +548,10 @@ def api_withdraw_request():
 
     con=db()
 
-    # Maximum cumulative withdrawal = 80% of approved deposits
-    dep = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE player_id=? AND type='Deposit' AND status='Approved'
-    """, (player["id"],)).fetchone()[0]
-
-    used = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE player_id=? AND type='Withdraw'
-          AND status IN ('Pending','Approved')
-    """, (player["id"],)).fetchone()[0]
-
-    max_withdraw = int(dep * 0.80)
-    remaining = max(0, max_withdraw - used)
-
-    unlimited = False
-    row = con.execute(
-        "SELECT unlimited_until FROM withdrawal_settings WHERE id=1"
-    ).fetchone()
-
-    if row and row[0]:
-        from datetime import datetime
-        try:
-            unlimited = datetime.fromisoformat(row[0]) > datetime.now()
-        except ValueError:
-            unlimited = False
-
-    if (not unlimited) and amount > remaining:
-        con.close()
-        return jsonify({
-            "ok": False,
-            "error": "80% withdrawal limit exceeded",
-            "approved_deposit": dep,
-            "max_withdraw": max_withdraw,
-            "already_used": used,
-            "remaining": remaining
-        }),400
-
-    account_holder = str(data.get("account_holder","")).strip()
-    account_number = str(data.get("account_number","")).strip()
-    ifsc = str(data.get("ifsc","")).strip().upper()
-    bank_name = str(data.get("bank_name","")).strip()
-
-    if not account_holder or not account_number or not ifsc:
-        con.close()
-        return jsonify({
-            "ok": False,
-            "error": "Bank details required"
-        }),400
-
     cur=con.execute("""
-        INSERT INTO money_requests(
-            player_id,type,amount,status,
-            account_holder,account_number,ifsc,bank_name
-        )
-        VALUES(?,'Withdraw',?,'Pending',?,?,?,?)
-    """,(
-        player["id"],amount,
-        account_holder,account_number,ifsc,bank_name
-    ))
+        INSERT INTO money_requests(player_id,type,amount,status)
+        VALUES(?,'Withdraw',?,'Pending')
+    """,(player["id"],amount))
 
     con.commit()
     request_id=cur.lastrowid
@@ -843,11 +655,6 @@ def api_admin_approve_money_request(req_id):
                 "Completed",
                 "DEP-"+str(req_id)
             ))
-
-            con.execute(
-                "UPDATE platform_wallet SET balance=balance+? WHERE id=1",
-                (req["amount"],)
-            )
 
         elif req["type"] == "Withdraw":
 
@@ -957,6 +764,8 @@ def api_admin_reject_money_request(req_id):
     })
 
 
+if __name__=="__main__":
+    app.run(host="0.0.0.0",port=8080)
 
 @app.route("/api/payment-settings", methods=["GET"])
 def api_payment_settings():
@@ -975,472 +784,3 @@ def api_payment_settings():
         })
 
     return jsonify(dict(row))
-
-
-@app.route("/api/admin/withdrawal-unlimited", methods=["POST"])
-def admin_withdrawal_unlimited():
-    expected = os.environ.get("SPIN123_ADMIN_API_KEY")
-    supplied = request.headers.get("X-Admin-Key", "")
-
-    if not expected or not secrets.compare_digest(expected, supplied):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-    data = request.get_json(silent=True) or {}
-
-    try:
-        minutes = int(data.get("minutes", 0))
-    except:
-        minutes = 0
-
-    con = db()
-
-    if minutes <= 0:
-        until = ""
-    else:
-        from datetime import datetime, timedelta
-        until = (datetime.now() + timedelta(minutes=minutes)).isoformat(timespec="seconds")
-
-    con.execute(
-        "UPDATE withdrawal_settings SET unlimited_until=? WHERE id=1",
-        (until,)
-    )
-    con.commit()
-    con.close()
-
-    return jsonify({
-        "ok": True,
-        "unlimited": bool(until),
-        "unlimited_until": until
-    })
-
-@app.route("/api/admin/withdrawal-unlimited", methods=["GET"])
-def admin_withdrawal_unlimited_status():
-    expected = os.environ.get("SPIN123_ADMIN_API_KEY")
-    supplied = request.headers.get("X-Admin-Key", "")
-
-    if not expected or not secrets.compare_digest(expected, supplied):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-
-    con = db()
-    row = con.execute(
-        "SELECT unlimited_until FROM withdrawal_settings WHERE id=1"
-    ).fetchone()
-    con.close()
-
-    until = row[0] if row else ""
-
-    return jsonify({
-        "ok": True,
-        "unlimited_until": until
-    })
-
-
-
-@app.route("/finance/request/<int:req_id>/approve", methods=["POST"])
-def finance_request_approve(req_id):
-    if not session.get("admin"):
-        return redirect("/login")
-
-    con = db()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        req = con.execute("""
-            SELECT id,player_id,type,amount,status
-            FROM money_requests
-            WHERE id=?
-        """,(req_id,)).fetchone()
-
-        if not req:
-            con.rollback(); con.close()
-            return page("<div class=card>Request not found</div>")
-
-        if req["status"] != "Pending":
-            con.rollback(); con.close()
-            return redirect("/finance")
-
-        if req["type"] == "Deposit":
-            con.execute(
-                "UPDATE players SET balance=balance+? WHERE id=?",
-                (req["amount"], req["player_id"])
-            )
-            con.execute("""
-                INSERT INTO wallet_transactions
-                (player_id,type,amount,status,reference)
-                VALUES(?,?,?,?,?)
-            """,(
-                req["player_id"], "Deposit", req["amount"],
-                "Completed", "DEP-"+str(req_id)
-            ))
-            con.execute(
-                "UPDATE platform_wallet SET balance=balance+? WHERE id=1",
-                (req["amount"],)
-            )
-
-        elif req["type"] == "Withdraw":
-            player = con.execute(
-                "SELECT balance FROM players WHERE id=?",
-                (req["player_id"],)
-            ).fetchone()
-
-            if not player or player["balance"] < req["amount"]:
-                con.rollback(); con.close()
-                return page("<div class=card>Insufficient player balance</div>")
-
-            platform = con.execute(
-                "SELECT balance FROM platform_wallet WHERE id=1"
-            ).fetchone()
-
-            if not platform or float(platform["balance"]) < float(req["amount"]):
-                con.rollback(); con.close()
-                return page("<div class=card>Insufficient platform balance</div>")
-
-            con.execute(
-                "UPDATE players SET balance=balance-? WHERE id=?",
-                (req["amount"], req["player_id"])
-            )
-            con.execute("""
-                INSERT INTO wallet_transactions
-                (player_id,type,amount,status,reference)
-                VALUES(?,?,?,?,?)
-            """,(
-                req["player_id"], "Withdraw", -req["amount"],
-                "Completed", "WDR-"+str(req_id)
-            ))
-            con.execute(
-                "UPDATE platform_wallet SET balance=balance-? WHERE id=1",
-                (req["amount"],)
-            )
-        else:
-            con.rollback(); con.close()
-            return page("<div class=card>Unknown request type</div>")
-
-        con.execute(
-            "UPDATE money_requests SET status='Approved' WHERE id=?",
-            (req_id,)
-        )
-        con.commit()
-        con.close()
-        return redirect("/finance")
-
-    except Exception as e:
-        con.rollback()
-        con.close()
-        return page("<div class=card>Approve failed: "+str(e)+"</div>")
-
-
-@app.route("/finance/request/<int:req_id>/reject", methods=["POST"])
-def finance_request_reject(req_id):
-    if not session.get("admin"):
-        return redirect("/login")
-
-    con = db()
-    req = con.execute(
-        "SELECT status FROM money_requests WHERE id=?",
-        (req_id,)
-    ).fetchone()
-
-    if not req:
-        con.close()
-        return page("<div class=card>Request not found</div>")
-
-    if req["status"] == "Pending":
-        con.execute(
-            "UPDATE money_requests SET status='Rejected' WHERE id=?",
-            (req_id,)
-        )
-        con.commit()
-
-    con.close()
-    return redirect("/finance")
-
-
-@app.route("/finance")
-def finance_panel():
-    if not session.get("admin"):
-        return redirect("/login")
-
-    import html
-    con = db()
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS platform_wallet(
-            id INTEGER PRIMARY KEY CHECK(id=1),
-            balance REAL NOT NULL DEFAULT 0
-        )
-    """)
-    con.execute(
-        "INSERT OR IGNORE INTO platform_wallet(id,balance) VALUES(1,0)"
-    )
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS admin_settlements(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            amount REAL NOT NULL,
-            account_holder TEXT NOT NULL,
-            account_number TEXT NOT NULL,
-            ifsc TEXT NOT NULL,
-            bank_name TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'Pending',
-            reference TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    wallet = con.execute(
-        "SELECT balance FROM platform_wallet WHERE id=1"
-    ).fetchone()
-
-    total_approved_deposit = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE type='Deposit' AND status='Approved'
-    """).fetchone()[0]
-
-    total_pending_deposit = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE type='Deposit' AND status='Pending'
-    """).fetchone()[0]
-
-    total_approved_withdrawal = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE type='Withdraw' AND status='Approved'
-    """).fetchone()[0]
-
-    total_pending_withdrawal = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE type='Withdraw' AND status='Pending'
-    """).fetchone()[0]
-
-    total_player_balance = con.execute("""
-        SELECT COALESCE(SUM(balance),0)
-        FROM players
-    """).fetchone()[0]
-
-    reqs = con.execute("""
-        SELECT
-            m.id,m.player_id,p.username,m.type,m.amount,m.status,
-            m.account_holder,m.account_number,m.ifsc,m.bank_name,
-            m.created_at
-        FROM money_requests m
-        LEFT JOIN players p ON p.id=m.player_id
-        ORDER BY m.id DESC
-        LIMIT 200
-    """).fetchall()
-
-    settlements = con.execute("""
-        SELECT id,amount,account_holder,account_number,ifsc,
-               bank_name,status,reference,created_at
-        FROM admin_settlements
-        ORDER BY id DESC
-        LIMIT 100
-    """).fetchall()
-
-    con.commit()
-    con.close()
-
-    balance = float(wallet[0] if wallet else 0)
-
-    deposits = ""
-    withdrawals = ""
-
-    for r in reqs:
-        player = html.escape(str(r["username"] or r["player_id"]))
-        status = html.escape(str(r["status"]))
-        amount = html.escape(str(r["amount"]))
-
-        if r["type"] == "Deposit":
-            deposits += (
-                "<tr>"
-                f"<td>{r['id']}</td>"
-                f"<td>{player}</td>"
-                f"<td>₹{amount}</td>"
-                f"<td>{status}</td>"
-                f"<td>{html.escape(str(r['created_at'] or ''))}</td>"
-                f"<td>{(
-                    '<form method=post action=/finance/request/'+str(r['id'])+'/approve style=display:inline><button>Approve</button></form>'
-                    '<form method=post action=/finance/request/'+str(r['id'])+'/reject style=display:inline><button>Reject</button></form>'
-                    if r['status']=='Pending' else ''
-                )}</td>"
-                "</tr>"
-            )
-
-        elif r["type"] == "Withdraw":
-            withdrawals += (
-                "<tr>"
-                f"<td>{r['id']}</td>"
-                f"<td>{player}</td>"
-                f"<td>₹{amount}</td>"
-                f"<td>{html.escape(str(r['account_holder'] or ''))}</td>"
-                f"<td>{html.escape(str(r['account_number'] or ''))}</td>"
-                f"<td>{html.escape(str(r['ifsc'] or ''))}</td>"
-                f"<td>{html.escape(str(r['bank_name'] or ''))}</td>"
-                f"<td>{status}</td>"
-                f"<td>{(
-                    '<form method=post action=/finance/request/'+str(r['id'])+'/approve style=display:inline><button>Approve</button></form>'
-                    '<form method=post action=/finance/request/'+str(r['id'])+'/reject style=display:inline><button>Reject</button></form>'
-                    if r['status']=='Pending' else ''
-                )}</td>"
-                "</tr>"
-            )
-
-    settlement_rows = ""
-
-    for x in settlements:
-        settlement_rows += (
-            "<tr>"
-            f"<td>{x['id']}</td>"
-            f"<td>₹{x['amount']}</td>"
-            f"<td>{html.escape(str(x['account_holder']))}</td>"
-            f"<td>{html.escape(str(x['account_number']))}</td>"
-            f"<td>{html.escape(str(x['ifsc']))}</td>"
-            f"<td>{html.escape(str(x['bank_name'] or ''))}</td>"
-            f"<td>{html.escape(str(x['status']))}</td>"
-            f"<td>{html.escape(str(x['reference'] or ''))}</td>"
-            "</tr>"
-        )
-
-    return page(f"""
-    <div class=grid>
-      <div class=card>
-        <b>Total Approved Deposits</b>
-        <h2>₹{float(total_approved_deposit):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Pending Deposits</b>
-        <h2>₹{float(total_pending_deposit):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Total Approved Withdrawals</b>
-        <h2>₹{float(total_approved_withdrawal):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Pending Withdrawals</b>
-        <h2>₹{float(total_pending_withdrawal):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Total Player Wallet Balance</b>
-        <h2>₹{float(total_player_balance):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Platform Ledger Balance</b>
-        <h2>₹{balance:.2f}</h2>
-      </div>
-    </div>
-
-    <div class=card>
-      <h2>Platform Account</h2>
-      <h1>₹{balance:.2f}</h1>
-      <p>Platform Ledger Balance</p>
-
-      <form method=post action="/finance/settlement">
-        <input type=number min=1 name=amount placeholder="Amount" required>
-        <input name=account_holder placeholder="Account Holder Name" required>
-        <input name=account_number placeholder="Account Number" required>
-        <input name=ifsc placeholder="IFSC" required>
-        <input name=bank_name placeholder="Bank Name">
-        <button>Create Settlement</button>
-      </form>
-    </div>
-
-    <div class=card>
-      <h2>Player Deposit Requests</h2>
-      <div style="overflow:auto">
-      <table>
-        <tr>
-          <th>ID</th><th>Player</th><th>Amount</th>
-          <th>Status</th><th>Created</th><th>Action</th>
-        </tr>
-        {deposits}
-      </table>
-      </div>
-    </div>
-
-    <div class=card>
-      <h2>Player Withdrawal Requests</h2>
-      <div style="overflow:auto">
-      <table>
-        <tr>
-          <th>ID</th><th>Player</th><th>Amount</th>
-          <th>Holder</th><th>Account No</th><th>IFSC</th>
-          <th>Bank</th><th>Status</th><th>Action</th>
-        </tr>
-        {withdrawals}
-      </table>
-      </div>
-    </div>
-
-    <div class=card>
-      <h2>Platform Settlement History</h2>
-      <div style="overflow:auto">
-      <table>
-        <tr>
-          <th>ID</th><th>Amount</th><th>Holder</th>
-          <th>Account No</th><th>IFSC</th><th>Bank</th>
-          <th>Status</th><th>Reference</th>
-        </tr>
-        {settlement_rows}
-      </table>
-      </div>
-    </div>
-    """)
-
-
-@app.route("/finance/settlement", methods=["POST"])
-def finance_settlement():
-    if not session.get("admin"):
-        return redirect("/login")
-
-    try:
-        amount = float(request.form.get("amount", 0))
-    except:
-        amount = 0
-
-    holder = request.form.get("account_holder", "").strip()
-    account = request.form.get("account_number", "").strip()
-    ifsc = request.form.get("ifsc", "").strip().upper()
-    bank = request.form.get("bank_name", "").strip()
-
-    if amount <= 0 or not holder or not account or not ifsc:
-        return page("<div class=card>Invalid settlement details</div>")
-
-    con = db()
-
-    row = con.execute(
-        "SELECT balance FROM platform_wallet WHERE id=1"
-    ).fetchone()
-
-    balance = float(row[0] if row else 0)
-
-    if amount > balance:
-        con.close()
-        return page(
-            f"<div class=card>Insufficient Platform Balance: ₹{balance:.2f}</div>"
-        )
-
-    import time
-    ref = "SET-" + str(int(time.time()))
-
-    con.execute("""
-        INSERT INTO admin_settlements(
-            amount,account_holder,account_number,ifsc,
-            bank_name,status,reference
-        )
-        VALUES(?,?,?,?,?,'Pending',?)
-    """,(amount,holder,account,ifsc,bank,ref))
-
-    con.execute(
-        "UPDATE platform_wallet SET balance=balance-? WHERE id=1",
-        (amount,)
-    )
-
-    con.commit()
-    con.close()
-
-    return redirect("/finance")
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)

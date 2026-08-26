@@ -4,6 +4,14 @@ import sqlite3, os
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY","change-this-secret-key")
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
 DB="admin.db"
 
 def db():

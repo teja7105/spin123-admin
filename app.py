@@ -447,7 +447,77 @@ def history():
         html+=f"<div class=card>{r['player']} — {r['type']} — ₹{r['amount']} — {r['status']}</div>"
     return page(html)
 
+
+def ensure_player_api_schema():
+    con = db()
+
+    # Upgrade old players table
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(players)").fetchall()}
+
+    if "password_hash" not in cols:
+        con.execute("ALTER TABLE players ADD COLUMN password_hash TEXT")
+
+    if "token" not in cols:
+        con.execute("ALTER TABLE players ADD COLUMN token TEXT")
+
+    if "created_at" not in cols:
+        con.execute("ALTER TABLE players ADD COLUMN created_at TEXT")
+
+    # Upgrade games table for player API
+    gcols = {r["name"] for r in con.execute("PRAGMA table_info(games)").fetchall()}
+
+    if "code" not in gcols:
+        con.execute("ALTER TABLE games ADD COLUMN code TEXT DEFAULT ''")
+
+    if "category" not in gcols:
+        con.execute("ALTER TABLE games ADD COLUMN category TEXT DEFAULT 'other'")
+
+    if "resource_url" not in gcols:
+        con.execute("ALTER TABLE games ADD COLUMN resource_url TEXT DEFAULT ''")
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS money_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER,
+            type TEXT NOT NULL,
+            amount INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            account_holder TEXT DEFAULT '',
+            account_number TEXT DEFAULT '',
+            ifsc TEXT DEFAULT '',
+            bank_name TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS wallet_transactions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER,
+            type TEXT,
+            amount INTEGER DEFAULT 0,
+            status TEXT DEFAULT '',
+            reference TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS withdrawal_settings(
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            unlimited_until TEXT DEFAULT ''
+        )
+    """)
+
+    con.execute(
+        "INSERT OR IGNORE INTO withdrawal_settings(id, unlimited_until) VALUES(1,'')"
+    )
+
+    con.commit()
+    con.close()
+
 init()
+ensure_player_api_schema()
 
 
 from flask import jsonify

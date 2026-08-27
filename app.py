@@ -18,6 +18,67 @@ def db():
 
 def init():
     con=db()
+
+    # Complete Finance database schema
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS platform_wallet(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        balance REAL NOT NULL DEFAULT 0
+    );
+
+    INSERT OR IGNORE INTO platform_wallet(id,balance)
+    VALUES(1,0);
+
+    CREATE TABLE IF NOT EXISTS admin_settlements(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        amount REAL NOT NULL,
+        account_holder TEXT NOT NULL,
+        account_number TEXT NOT NULL,
+        ifsc TEXT NOT NULL,
+        bank_name TEXT DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'Pending',
+        reference TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS money_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_id INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        amount REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'Pending',
+        account_holder TEXT DEFAULT '',
+        account_number TEXT DEFAULT '',
+        ifsc TEXT DEFAULT '',
+        bank_name TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS wallet_transactions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_id INTEGER NOT NULL,
+        type TEXT NOT NULL,
+        amount REAL NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'Completed',
+        reference TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    # Upgrade old money_requests table if it already existed
+    cols = {r[1] for r in con.execute("PRAGMA table_info(money_requests)").fetchall()}
+
+    for name, ddl in [
+        ("account_holder", "TEXT DEFAULT ''"),
+        ("account_number", "TEXT DEFAULT ''"),
+        ("ifsc", "TEXT DEFAULT ''"),
+        ("bank_name", "TEXT DEFAULT ''"),
+        ("created_at", "TEXT DEFAULT ''")
+    ]:
+        if name not in cols:
+            con.execute(f"ALTER TABLE money_requests ADD COLUMN {name} {ddl}")
+
+    con.commit()
     con.execute("""
         CREATE TABLE IF NOT EXISTS platform_wallet (
             id INTEGER PRIMARY KEY,

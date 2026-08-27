@@ -18,6 +18,16 @@ def db():
 
 def init():
     con=db()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS platform_wallet (
+            id INTEGER PRIMARY KEY,
+            balance REAL NOT NULL DEFAULT 0
+        )
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO platform_wallet(id,balance) VALUES(1,0)"
+    )
+    con.commit()
     con.executescript("""
     CREATE TABLE IF NOT EXISTS players(
       id INTEGER PRIMARY KEY AUTOINCREMENT,

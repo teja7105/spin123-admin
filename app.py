@@ -4,14 +4,6 @@ import sqlite3, os
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY","change-this-secret-key")
-
-@app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Admin-Key"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    return response
-
 DB="admin.db"
 
 def db():
@@ -62,24 +54,7 @@ def init():
     note TEXT DEFAULT '',
     enabled INTEGER DEFAULT 1
 );
-    CREATE TABLE IF NOT EXISTS platform_wallet(
-      id INTEGER PRIMARY KEY CHECK(id=1),
-      balance REAL NOT NULL DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS admin_settlements(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      amount REAL NOT NULL,
-      account_holder TEXT NOT NULL,
-      account_number TEXT NOT NULL,
-      ifsc TEXT NOT NULL,
-      bank_name TEXT DEFAULT '',
-      status TEXT NOT NULL DEFAULT 'Pending',
-      reference TEXT DEFAULT '',
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
 """)
-    con.execute("INSERT OR IGNORE INTO platform_wallet(id,balance) VALUES(1,0)")
-
     if con.execute("SELECT COUNT(*) c FROM games").fetchone()["c"]==0:
         con.executemany("INSERT INTO games(name) VALUES(?)",
                        [("Aviator",),("Slots",),("Lucky Gems Demo",)])
@@ -154,7 +129,7 @@ def auth():
 @app.route("/login",methods=["GET","POST"])
 def login():
     if request.method=="POST":
-        if request.form.get("user")==os.environ.get("SPIN123_ADMIN_USER","admin") and request.form.get("pass")==os.environ.get("ADMIN_PASSWORD","123456"):
+        if request.form.get("user")==os.environ.get("SPIN123_ADMIN_USER","Id7297862426") and request.form.get("pass")==os.environ.get("ADMIN_PASSWORD","7297862426"):
             session["admin"]=1
             return redirect("/")
         return page("<div class=card>Wrong username or password</div>")
@@ -447,77 +422,7 @@ def history():
         html+=f"<div class=card>{r['player']} — {r['type']} — ₹{r['amount']} — {r['status']}</div>"
     return page(html)
 
-
-def ensure_player_api_schema():
-    con = db()
-
-    # Upgrade old players table
-    cols = {r["name"] for r in con.execute("PRAGMA table_info(players)").fetchall()}
-
-    if "password_hash" not in cols:
-        con.execute("ALTER TABLE players ADD COLUMN password_hash TEXT")
-
-    if "token" not in cols:
-        con.execute("ALTER TABLE players ADD COLUMN token TEXT")
-
-    if "created_at" not in cols:
-        con.execute("ALTER TABLE players ADD COLUMN created_at TEXT")
-
-    # Upgrade games table for player API
-    gcols = {r["name"] for r in con.execute("PRAGMA table_info(games)").fetchall()}
-
-    if "code" not in gcols:
-        con.execute("ALTER TABLE games ADD COLUMN code TEXT DEFAULT ''")
-
-    if "category" not in gcols:
-        con.execute("ALTER TABLE games ADD COLUMN category TEXT DEFAULT 'other'")
-
-    if "resource_url" not in gcols:
-        con.execute("ALTER TABLE games ADD COLUMN resource_url TEXT DEFAULT ''")
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS money_requests(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER,
-            type TEXT NOT NULL,
-            amount INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'Pending',
-            account_holder TEXT DEFAULT '',
-            account_number TEXT DEFAULT '',
-            ifsc TEXT DEFAULT '',
-            bank_name TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS wallet_transactions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER,
-            type TEXT,
-            amount INTEGER DEFAULT 0,
-            status TEXT DEFAULT '',
-            reference TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS withdrawal_settings(
-            id INTEGER PRIMARY KEY CHECK(id=1),
-            unlimited_until TEXT DEFAULT ''
-        )
-    """)
-
-    con.execute(
-        "INSERT OR IGNORE INTO withdrawal_settings(id, unlimited_until) VALUES(1,'')"
-    )
-
-    con.commit()
-    con.close()
-
 init()
-ensure_player_api_schema()
 
 
 from flask import jsonify
@@ -922,11 +827,6 @@ def api_admin_approve_money_request(req_id):
                 "DEP-"+str(req_id)
             ))
 
-            con.execute(
-                "UPDATE platform_wallet SET balance=balance+? WHERE id=1",
-                (req["amount"],)
-            )
-
         elif req["type"] == "Withdraw":
 
             player=con.execute(
@@ -1113,125 +1013,6 @@ def admin_withdrawal_unlimited_status():
     })
 
 
-
-@app.route("/finance/request/<int:req_id>/approve", methods=["POST"])
-def finance_request_approve(req_id):
-    if not session.get("admin"):
-        return redirect("/login")
-
-    con = db()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        req = con.execute("""
-            SELECT id,player_id,type,amount,status
-            FROM money_requests
-            WHERE id=?
-        """,(req_id,)).fetchone()
-
-        if not req:
-            con.rollback(); con.close()
-            return page("<div class=card>Request not found</div>")
-
-        if req["status"] != "Pending":
-            con.rollback(); con.close()
-            return redirect("/finance")
-
-        if req["type"] == "Deposit":
-            con.execute(
-                "UPDATE players SET balance=balance+? WHERE id=?",
-                (req["amount"], req["player_id"])
-            )
-            con.execute("""
-                INSERT INTO wallet_transactions
-                (player_id,type,amount,status,reference)
-                VALUES(?,?,?,?,?)
-            """,(
-                req["player_id"], "Deposit", req["amount"],
-                "Completed", "DEP-"+str(req_id)
-            ))
-            con.execute(
-                "UPDATE platform_wallet SET balance=balance+? WHERE id=1",
-                (req["amount"],)
-            )
-
-        elif req["type"] == "Withdraw":
-            player = con.execute(
-                "SELECT balance FROM players WHERE id=?",
-                (req["player_id"],)
-            ).fetchone()
-
-            if not player or player["balance"] < req["amount"]:
-                con.rollback(); con.close()
-                return page("<div class=card>Insufficient player balance</div>")
-
-            platform = con.execute(
-                "SELECT balance FROM platform_wallet WHERE id=1"
-            ).fetchone()
-
-            if not platform or float(platform["balance"]) < float(req["amount"]):
-                con.rollback(); con.close()
-                return page("<div class=card>Insufficient platform balance</div>")
-
-            con.execute(
-                "UPDATE players SET balance=balance-? WHERE id=?",
-                (req["amount"], req["player_id"])
-            )
-            con.execute("""
-                INSERT INTO wallet_transactions
-                (player_id,type,amount,status,reference)
-                VALUES(?,?,?,?,?)
-            """,(
-                req["player_id"], "Withdraw", -req["amount"],
-                "Completed", "WDR-"+str(req_id)
-            ))
-            con.execute(
-                "UPDATE platform_wallet SET balance=balance-? WHERE id=1",
-                (req["amount"],)
-            )
-        else:
-            con.rollback(); con.close()
-            return page("<div class=card>Unknown request type</div>")
-
-        con.execute(
-            "UPDATE money_requests SET status='Approved' WHERE id=?",
-            (req_id,)
-        )
-        con.commit()
-        con.close()
-        return redirect("/finance")
-
-    except Exception as e:
-        con.rollback()
-        con.close()
-        return page("<div class=card>Approve failed: "+str(e)+"</div>")
-
-
-@app.route("/finance/request/<int:req_id>/reject", methods=["POST"])
-def finance_request_reject(req_id):
-    if not session.get("admin"):
-        return redirect("/login")
-
-    con = db()
-    req = con.execute(
-        "SELECT status FROM money_requests WHERE id=?",
-        (req_id,)
-    ).fetchone()
-
-    if not req:
-        con.close()
-        return page("<div class=card>Request not found</div>")
-
-    if req["status"] == "Pending":
-        con.execute(
-            "UPDATE money_requests SET status='Rejected' WHERE id=?",
-            (req_id,)
-        )
-        con.commit()
-
-    con.close()
-    return redirect("/finance")
-
-
 @app.route("/finance")
 def finance_panel():
     if not session.get("admin"):
@@ -1267,35 +1048,6 @@ def finance_panel():
     wallet = con.execute(
         "SELECT balance FROM platform_wallet WHERE id=1"
     ).fetchone()
-
-    total_approved_deposit = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE type='Deposit' AND status='Approved'
-    """).fetchone()[0]
-
-    total_pending_deposit = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE type='Deposit' AND status='Pending'
-    """).fetchone()[0]
-
-    total_approved_withdrawal = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE type='Withdraw' AND status='Approved'
-    """).fetchone()[0]
-
-    total_pending_withdrawal = con.execute("""
-        SELECT COALESCE(SUM(amount),0)
-        FROM money_requests
-        WHERE type='Withdraw' AND status='Pending'
-    """).fetchone()[0]
-
-    total_player_balance = con.execute("""
-        SELECT COALESCE(SUM(balance),0)
-        FROM players
-    """).fetchone()[0]
 
     reqs = con.execute("""
         SELECT
@@ -1337,11 +1089,6 @@ def finance_panel():
                 f"<td>₹{amount}</td>"
                 f"<td>{status}</td>"
                 f"<td>{html.escape(str(r['created_at'] or ''))}</td>"
-                f"<td>{(
-                    '<form method=post action=/finance/request/'+str(r['id'])+'/approve style=display:inline><button>Approve</button></form>'
-                    '<form method=post action=/finance/request/'+str(r['id'])+'/reject style=display:inline><button>Reject</button></form>'
-                    if r['status']=='Pending' else ''
-                )}</td>"
                 "</tr>"
             )
 
@@ -1356,11 +1103,6 @@ def finance_panel():
                 f"<td>{html.escape(str(r['ifsc'] or ''))}</td>"
                 f"<td>{html.escape(str(r['bank_name'] or ''))}</td>"
                 f"<td>{status}</td>"
-                f"<td>{(
-                    '<form method=post action=/finance/request/'+str(r['id'])+'/approve style=display:inline><button>Approve</button></form>'
-                    '<form method=post action=/finance/request/'+str(r['id'])+'/reject style=display:inline><button>Reject</button></form>'
-                    if r['status']=='Pending' else ''
-                )}</td>"
                 "</tr>"
             )
 
@@ -1381,33 +1123,6 @@ def finance_panel():
         )
 
     return page(f"""
-    <div class=grid>
-      <div class=card>
-        <b>Total Approved Deposits</b>
-        <h2>₹{float(total_approved_deposit):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Pending Deposits</b>
-        <h2>₹{float(total_pending_deposit):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Total Approved Withdrawals</b>
-        <h2>₹{float(total_approved_withdrawal):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Pending Withdrawals</b>
-        <h2>₹{float(total_pending_withdrawal):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Total Player Wallet Balance</b>
-        <h2>₹{float(total_player_balance):.2f}</h2>
-      </div>
-      <div class=card>
-        <b>Platform Ledger Balance</b>
-        <h2>₹{balance:.2f}</h2>
-      </div>
-    </div>
-
     <div class=card>
       <h2>Platform Account</h2>
       <h1>₹{balance:.2f}</h1>
@@ -1429,7 +1144,7 @@ def finance_panel():
       <table>
         <tr>
           <th>ID</th><th>Player</th><th>Amount</th>
-          <th>Status</th><th>Created</th><th>Action</th>
+          <th>Status</th><th>Created</th>
         </tr>
         {deposits}
       </table>
@@ -1443,7 +1158,7 @@ def finance_panel():
         <tr>
           <th>ID</th><th>Player</th><th>Amount</th>
           <th>Holder</th><th>Account No</th><th>IFSC</th>
-          <th>Bank</th><th>Status</th><th>Action</th>
+          <th>Bank</th><th>Status</th>
         </tr>
         {withdrawals}
       </table>
@@ -1519,6 +1234,214 @@ def finance_settlement():
 
     return redirect("/finance")
 
+
+
+# ===== SPIN777 LEGACY / PROBE BRIDGE =====
+# Safe compatibility layer for an authorized legacy client.
+# It does not bypass TLS, DNS, authentication, or a third-party server.
+import json as _legacy_json
+from datetime import datetime as _legacy_datetime
+
+def _legacy_probe_enabled():
+    return os.environ.get("LEGACY_PROBE", "1").lower() in ("1", "true", "yes", "on")
+
+def _legacy_ensure_tables():
+    con = db()
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS legacy_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            method TEXT,
+            path TEXT,
+            query TEXT,
+            content_type TEXT,
+            body TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    con.commit()
+    con.close()
+
+def _legacy_payload_body():
+    data = request.get_json(silent=True)
+    if isinstance(data, dict):
+        return data
+    data = {}
+    # Form fields are useful for old clients that don't send JSON.
+    for k in request.form.keys():
+        data[k] = request.form.get(k)
+    return data
+
+def _legacy_log_request():
+    if not _legacy_probe_enabled():
+        return
+    try:
+        _legacy_ensure_tables()
+        body = _legacy_payload_body()
+        safe = {}
+        # Never store passwords, tokens, cookies, card/account numbers, or auth secrets.
+        sensitive = {
+            "password","pass","pwd","token","authorization","cookie",
+            "accountnumber","account_number","cardno","card_no","ifsc",
+            "upi","upi_id"
+        }
+        for k, v in body.items():
+            if str(k).lower() in sensitive:
+                safe[k] = "[REDACTED]"
+            else:
+                s = str(v)
+                safe[k] = s[:500]
+        con = db()
+        con.execute(
+            """INSERT INTO legacy_requests(method,path,query,content_type,body)
+               VALUES(?,?,?,?,?)""",
+            (
+                request.method,
+                request.path,
+                request.query_string.decode("utf-8", "ignore")[:2000],
+                request.headers.get("Content-Type","")[:200],
+                _legacy_json.dumps(safe, ensure_ascii=False)[:8000],
+            )
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+def _legacy_player_from_token():
+    # Reuse the existing bearer-token auth first.
+    try:
+        return api_player()
+    except Exception:
+        return None
+
+def _legacy_public_player(row):
+    if not row:
+        return None
+    return {
+        "userId": row["id"],
+        "uid": row["id"],
+        "id": row["id"],
+        "name": row["username"],
+        "nickname": row["username"],
+        "username": row["username"],
+        "balance": float(row["balance"] or 0),
+        "money": float(row["balance"] or 0),
+        "wallet": float(row["balance"] or 0),
+        "vip": row["vip"],
+        "status": row["status"],
+    }
+
+def _legacy_success(row=None, extra=None, msg="success"):
+    data = _legacy_public_player(row) if row is not None else {}
+    if extra:
+        if data is None:
+            data = {}
+        data.update(extra)
+    return jsonify({"ok": True, "code": 0, "msg": msg, "data": data})
+
+@app.route("/api/health", methods=["GET"])
+def legacy_health():
+    return jsonify({
+        "ok": True,
+        "service": "spin123-admin",
+        "bridge": "legacy-ready",
+        "probe": _legacy_probe_enabled(),
+        "time": _legacy_datetime.utcnow().isoformat() + "Z",
+    })
+
+@app.route("/legacy/login", methods=["POST"])
+@app.route("/user/login", methods=["POST"])
+def legacy_login_alias():
+    _legacy_log_request()
+    # The existing /api/login is the canonical authentication implementation.
+    return api_login()
+
+@app.route("/legacy/profile", methods=["GET","POST"])
+@app.route("/user/info", methods=["GET","POST"])
+def legacy_profile_alias():
+    _legacy_log_request()
+    player = _legacy_player_from_token()
+    if not player:
+        return jsonify({"ok": False, "code": 401, "msg": "Unauthorized"}), 401
+    return _legacy_success(player)
+
+@app.route("/wallet", methods=["GET","POST"])
+@app.route("/balance", methods=["GET","POST"])
+@app.route("/legacy/wallet", methods=["GET","POST"])
+def legacy_wallet_alias():
+    _legacy_log_request()
+    player = _legacy_player_from_token()
+    if not player:
+        return jsonify({"ok": False, "code": 401, "msg": "Unauthorized"}), 401
+    return _legacy_success(player, {
+        "balance": float(player["balance"] or 0),
+        "money": float(player["balance"] or 0),
+        "wallet": float(player["balance"] or 0),
+    })
+
+@app.route("/deposit", methods=["POST"])
+@app.route("/recharge", methods=["POST"])
+@app.route("/legacy/deposit", methods=["POST"])
+def legacy_deposit_alias():
+    _legacy_log_request()
+    # Existing handler already validates bearer auth and amount.
+    return api_deposit_request()
+
+@app.route("/withdraw", methods=["POST"])
+@app.route("/legacy/withdraw", methods=["POST"])
+def legacy_withdraw_alias():
+    _legacy_log_request()
+    # Existing handler already validates bearer auth and bank fields.
+    return api_withdraw_request()
+
+@app.route("/transaction", methods=["GET"])
+@app.route("/record", methods=["GET"])
+@app.route("/legacy/history", methods=["GET"])
+def legacy_history_alias():
+    _legacy_log_request()
+    player = _legacy_player_from_token()
+    if not player:
+        return jsonify({"ok": False, "code": 401, "msg": "Unauthorized"}), 401
+    con = db()
+    rows = con.execute(
+        """SELECT id,type,amount,status,reference,created_at
+           FROM wallet_transactions WHERE player_id=?
+           ORDER BY id DESC LIMIT 200""",
+        (player["id"],)
+    ).fetchall()
+    con.close()
+    return jsonify({
+        "ok": True, "code": 0, "msg": "success",
+        "data": [dict(x) for x in rows]
+    })
+
+@app.route("/api/admin/legacy-requests", methods=["GET"])
+def legacy_admin_requests():
+    if not session.get("admin"):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    _legacy_ensure_tables()
+    con = db()
+    rows = con.execute(
+        """SELECT id,method,path,query,content_type,body,created_at
+           FROM legacy_requests ORDER BY id DESC LIMIT 500"""
+    ).fetchall()
+    con.close()
+    return jsonify({"ok": True, "requests": [dict(x) for x in rows]})
+
+# Capture only unmatched requests. We keep the original 404 behavior,
+# so the probe cannot accidentally make an unsupported API look successful.
+@app.errorhandler(404)
+def legacy_probe_404(err):
+    _legacy_log_request()
+    return jsonify({
+        "ok": False,
+        "code": 404,
+        "msg": "route not mapped",
+        "path": request.path
+    }), 404
+
+_legacy_ensure_tables()
+# ===== END LEGACY / PROBE BRIDGE =====
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

@@ -1052,7 +1052,6 @@ def finance_panel():
         LIMIT 100
     """).fetchall()
 
-    con.commit()
     con.close()
 
     balance = float(wallet[0] if wallet else 0)

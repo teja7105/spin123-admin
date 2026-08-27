@@ -7,8 +7,13 @@ app.secret_key = os.environ.get("SECRET_KEY","change-this-secret-key")
 DB="admin.db"
 
 def db():
-    con=sqlite3.connect(DB)
+    con=sqlite3.connect(DB, timeout=30)
     con.row_factory=sqlite3.Row
+    con.execute("PRAGMA busy_timeout=30000")
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
     return con
 
 def init():
@@ -1021,29 +1026,8 @@ def finance_panel():
     import html
     con = db()
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS platform_wallet(
-            id INTEGER PRIMARY KEY CHECK(id=1),
-            balance REAL NOT NULL DEFAULT 0
-        )
-    """)
-    con.execute(
-        "INSERT OR IGNORE INTO platform_wallet(id,balance) VALUES(1,0)"
-    )
-
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS admin_settlements(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            amount REAL NOT NULL,
-            account_holder TEXT NOT NULL,
-            account_number TEXT NOT NULL,
-            ifsc TEXT NOT NULL,
-            bank_name TEXT DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'Pending',
-            reference TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+    # Schema initialized at startup. Keep this GET read-only
+    # to avoid SQLite write locks under concurrent requests.
 
     wallet = con.execute(
         "SELECT balance FROM platform_wallet WHERE id=1"

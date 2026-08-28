@@ -1653,3 +1653,24 @@ _legacy_ensure_tables()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
+
+# ===== PLAYERS AUTH SCHEMA MIGRATION =====
+def migrate_players_auth_schema():
+    con = db()
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(players)").fetchall()}
+
+    if "password_hash" not in cols:
+        con.execute("ALTER TABLE players ADD COLUMN password_hash TEXT")
+
+    if "token" not in cols:
+        con.execute("ALTER TABLE players ADD COLUMN token TEXT")
+
+    if "created_at" not in cols:
+        con.execute("ALTER TABLE players ADD COLUMN created_at TEXT")
+
+    con.commit()
+    con.close()
+
+migrate_players_auth_schema()
+# ===== END PLAYERS AUTH SCHEMA MIGRATION =====

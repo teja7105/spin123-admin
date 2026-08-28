@@ -1030,7 +1030,7 @@ def finance_panel():
     # to avoid SQLite write locks under concurrent requests.
 
     wallet = con.execute(
-        "SELECT balance FROM platform_wallet WHERE id=1"
+        "SELECT balance FROM platform_account WHERE id=1"
     ).fetchone()
 
     reqs = con.execute("""
@@ -1186,7 +1186,7 @@ def finance_settlement():
     con = db()
 
     row = con.execute(
-        "SELECT balance FROM platform_wallet WHERE id=1"
+        "SELECT balance FROM platform_account WHERE id=1"
     ).fetchone()
 
     balance = float(row[0] if row else 0)
@@ -1209,7 +1209,7 @@ def finance_settlement():
     """,(amount,holder,account,ifsc,bank,ref))
 
     con.execute(
-        "UPDATE platform_wallet SET balance=balance-? WHERE id=1",
+        "UPDATE platform_account SET balance=balance-? WHERE id=1",
         (amount,)
     )
 

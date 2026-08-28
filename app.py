@@ -221,6 +221,34 @@ def payments():
                     (request.form["player"],request.form["type"],request.form["amount"]))
         con.commit()
     rows=con.execute("SELECT * FROM payments ORDER BY id DESC").fetchall()
+
+    # ===== PAYMENT TOTAL SUMMARY =====
+    try:
+        total_deposit = float(con.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE type='Deposit'"
+        ).fetchone()[0] or 0)
+        total_withdraw = float(con.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE type='Withdraw'"
+        ).fetchone()[0] or 0)
+        total_refund = float(con.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE type='Refund'"
+        ).fetchone()[0] or 0)
+        total_pending = float(con.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE status='Pending'"
+        ).fetchone()[0] or 0)
+        total_approved = float(con.execute(
+            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE status='Approved'"
+        ).fetchone()[0] or 0)
+    except Exception:
+        total_deposit = total_withdraw = total_refund = 0.0
+        total_pending = total_approved = 0.0
+
+    try:
+        prow = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()
+        platform_balance = float(prow[0] if prow else 0)
+    except Exception:
+        platform_balance = 0.0
+
     con.close()
     cfgcon=db()
     cfg=cfgcon.execute("SELECT upi_id,qr_url,account_name,note FROM payment_settings WHERE id=1").fetchone()
@@ -281,7 +309,21 @@ def payments():
         <p><b>UPI ID:</b> {upi}</p>"""
     qr_card+="</div>"
 
-    html=qr_card+"""
+    summary_card=f"""
+<div class=card>
+<h2>Payment Amount Summary</h2>
+<div class=grid>
+  <div class=card><b>Total Deposits</b><h2>₹{total_deposit:,.2f}</h2></div>
+  <div class=card><b>Total Withdrawals</b><h2>₹{total_withdraw:,.2f}</h2></div>
+  <div class=card><b>Total Refunds</b><h2>₹{total_refund:,.2f}</h2></div>
+  <div class=card><b>Pending Amount</b><h2>₹{total_pending:,.2f}</h2></div>
+  <div class=card><b>Approved Amount</b><h2>₹{total_approved:,.2f}</h2></div>
+  <div class=card><b>Platform Balance</b><h2>₹{platform_balance:,.2f}</h2></div>
+</div>
+</div>
+"""
+
+    html=summary_card+qr_card+"""
 <div class=card>
 <h3>Temporary Unlimited Withdrawal</h3>
 <p>Time खत्म होने पर 80% withdrawal rule अपने आप वापस लागू होगा.</p>

@@ -1771,3 +1771,208 @@ def migrate_finance_schema():
 
 migrate_finance_schema()
 # ===== END FINANCE PAGE SCHEMA FIX =====
+
+
+# ===== SPIN123 PAYMENT WEBHOOK + AUTO CREDIT =====
+import hmac as _spin_hmac
+import hashlib as _spin_hashlib
+import time as _spin_time
+
+def _spin123_payment_schema():
+    con = db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS payment_events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id TEXT UNIQUE NOT NULL,
+        player_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        utr TEXT UNIQUE,
+        provider_status TEXT NOT NULL,
+        credited INTEGER NOT NULL DEFAULT 0,
+        raw_payload TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_direct_credits(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_id INTEGER NOT NULL,
+        amount REAL NOT NULL,
+        note TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    con.commit()
+    con.close()
+
+_spin123_payment_schema()
+
+def _spin123_webhook_secret():
+    return os.environ.get("PAYMENT_WEBHOOK_SECRET", "").encode()
+
+def _spin123_sig_message(data):
+    fields = [
+        str(data.get("event_id", "")),
+        str(data.get("user_id", "")),
+        str(data.get("amount", "")),
+        str(data.get("utr", "")),
+        str(data.get("status", "")),
+        str(data.get("timestamp", "")),
+    ]
+    return "|".join(fields).encode()
+
+def _spin123_verify_signature(data, supplied):
+    secret = _spin123_webhook_secret()
+    if not secret or not supplied:
+        return False
+    expected = _spin_hmac.new(secret, _spin123_sig_message(data), _spin_hashlib.sha256).hexdigest()
+    return _spin_hmac.compare_digest(expected, supplied)
+
+@app.route("/api/payment/webhook", methods=["POST"])
+def spin123_payment_webhook():
+    data = request.get_json(silent=True) or {}
+    sig = request.headers.get("X-Spin123-Signature", "").strip()
+
+    if not _spin123_verify_signature(data, sig):
+        return jsonify({"ok": False, "error": "Invalid webhook signature"}), 401
+
+    try:
+        event_id = str(data["event_id"]).strip()
+        player_id = int(data["user_id"])
+        amount = float(data["amount"])
+        utr = str(data.get("utr", "")).strip()
+        status = str(data.get("status", "")).strip().upper()
+        ts = int(data.get("timestamp", 0))
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid payload"}), 400
+
+    if not event_id or amount <= 0 or not utr:
+        return jsonify({"ok": False, "error": "Missing event_id/amount/utr"}), 400
+
+    if ts and abs(int(_spin_time.time()) - ts) > 900:
+        return jsonify({"ok": False, "error": "Stale webhook"}), 400
+
+    con = db()
+    player = con.execute("SELECT id FROM players WHERE id=?", (player_id,)).fetchone()
+    if not player:
+        con.close()
+        return jsonify({"ok": False, "error": "Unknown user_id"}), 404
+
+    old = con.execute(
+        "SELECT id,credited,provider_status FROM payment_events WHERE event_id=? OR utr=?",
+        (event_id, utr)
+    ).fetchone()
+
+    if old:
+        con.close()
+        return jsonify({
+            "ok": True,
+            "duplicate": True,
+            "credited": bool(old["credited"]),
+            "status": old["provider_status"]
+        })
+
+    credited = 0
+    success_states = {"SUCCESS", "SUCCESSFUL", "PAID", "COMPLETED", "VERIFIED"}
+
+    con.execute(
+        """INSERT INTO payment_events(event_id,player_id,amount,utr,provider_status,credited,raw_payload)
+           VALUES(?,?,?,?,?,?,?)""",
+        (event_id, player_id, amount, utr, status, 0, json.dumps(data, separators=(",", ":")))
+    )
+
+    if status in success_states:
+        con.execute("UPDATE players SET balance=balance+? WHERE id=?", (amount, player_id))
+        credited = 1
+        con.execute("UPDATE payment_events SET credited=1 WHERE event_id=?", (event_id,))
+        try:
+            con.execute(
+                """INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
+                   VALUES(?,'Deposit',?,'Approved',?)""",
+                (player_id, amount, utr)
+            )
+        except Exception:
+            pass
+
+        try:
+            row = con.execute(
+                """SELECT id FROM money_requests
+                   WHERE player_id=? AND type='Deposit' AND status='Pending' AND amount=?
+                   ORDER BY id ASC LIMIT 1""",
+                (player_id, amount)
+            ).fetchone()
+            if row:
+                con.execute(
+                    "UPDATE money_requests SET status='Approved', reference=? WHERE id=?",
+                    (utr, row["id"])
+                )
+        except Exception:
+            pass
+
+    con.commit()
+    bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()["balance"]
+    con.close()
+
+    return jsonify({
+        "ok": True,
+        "event_id": event_id,
+        "user_id": player_id,
+        "utr": utr,
+        "provider_status": status,
+        "credited": bool(credited),
+        "balance": bal
+    })
+
+@app.route("/api/admin/direct-credit", methods=["POST"])
+def spin123_admin_direct_credit():
+    if not session.get("admin"):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True) or request.form or {}
+    try:
+        player_id = int(data.get("user_id", 0))
+        amount = float(data.get("amount", 0))
+    except Exception:
+        return jsonify({"ok": False, "error": "Invalid user_id/amount"}), 400
+
+    note = str(data.get("note", "")).strip()
+    if player_id <= 0 or amount <= 0:
+        return jsonify({"ok": False, "error": "Invalid user_id/amount"}), 400
+
+    con = db()
+    player = con.execute("SELECT id FROM players WHERE id=?", (player_id,)).fetchone()
+    if not player:
+        con.close()
+        return jsonify({"ok": False, "error": "Player not found"}), 404
+
+    con.execute("UPDATE players SET balance=balance+? WHERE id=?", (amount, player_id))
+    con.execute(
+        "INSERT INTO admin_direct_credits(player_id,amount,note) VALUES(?,?,?)",
+        (player_id, amount, note)
+    )
+    try:
+        con.execute(
+            """INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
+               VALUES(?,'AdminCredit',?,'Approved',?)""",
+            (player_id, amount, note or "ADMIN-DIRECT-CREDIT")
+        )
+    except Exception:
+        pass
+
+    con.commit()
+    bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()["balance"]
+    con.close()
+
+    return jsonify({"ok": True, "user_id": player_id, "credited": amount, "balance": bal})
+
+@app.route("/api/admin/payment-events", methods=["GET"])
+def spin123_admin_payment_events():
+    if not session.get("admin"):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    con = db()
+    rows = con.execute(
+        """SELECT id,event_id,player_id,amount,utr,provider_status,credited,created_at
+           FROM payment_events ORDER BY id DESC LIMIT 500"""
+    ).fetchall()
+    con.close()
+    return jsonify({"ok": True, "rows": [dict(r) for r in rows]})
+# ===== END SPIN123 PAYMENT WEBHOOK + AUTO CREDIT =====

@@ -1674,3 +1674,41 @@ def migrate_players_auth_schema():
 
 migrate_players_auth_schema()
 # ===== END PLAYERS AUTH SCHEMA MIGRATION =====
+
+
+# ===== MONEY REQUESTS SCHEMA FIX =====
+def migrate_money_requests():
+    con = db()
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS money_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            amount INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            reference TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cols = {
+        r["name"]
+        for r in con.execute("PRAGMA table_info(money_requests)").fetchall()
+    }
+
+    if "reference" not in cols:
+        con.execute(
+            "ALTER TABLE money_requests ADD COLUMN reference TEXT DEFAULT ''"
+        )
+
+    if "created_at" not in cols:
+        con.execute(
+            "ALTER TABLE money_requests ADD COLUMN created_at TEXT"
+        )
+
+    con.commit()
+    con.close()
+
+migrate_money_requests()
+# ===== END MONEY REQUESTS SCHEMA FIX =====

@@ -456,7 +456,32 @@ def notifications():
 @app.route("/support")
 def support():
     if not auth(): return redirect("/login")
-    return page("<div class=card><h3>Customer Support</h3>Support module ready for backend integration.</div>")
+    con=db()
+    rows=con.execute("""
+        SELECT p.id,p.username,
+               COUNT(sm.id) AS message_count,
+               MAX(sm.created_at) AS last_message,
+               SUM(CASE WHEN sm.sender='player' AND sm.is_read=0 THEN 1 ELSE 0 END) AS unread
+        FROM players p
+        JOIN support_messages sm ON sm.player_id=p.id
+        GROUP BY p.id,p.username
+        ORDER BY last_message DESC
+    """).fetchall()
+    con.close()
+    import html
+    body="<div class=card><h2>Player Support Inbox</h2><p>Text, image, PDF/document support chat.</p></div>"
+    if not rows:
+        body += "<div class=card>No support conversations yet.</div>"
+    for r in rows:
+        body += (
+            "<div class=card>"
+            f"<b>User ID {r['id']} — {html.escape(str(r['username']))}</b><br>"
+            f"Messages: {r['message_count']} &nbsp; Unread: {r['unread'] or 0}<br>"
+            f"Last: {html.escape(str(r['last_message'] or ''))}<br><br>"
+            f"<a href='/support/{r['id']}'><button>Open Chat</button></a>"
+            "</div>"
+        )
+    return page(body)
 
 @app.route("/history")
 def history():
@@ -2549,6 +2574,219 @@ def spin123_admin_payment_events():
 # ===== END SPIN123 COMPLETE PAYMENT FLOW =====
 
 
+
+
+# ===== SPIN123 COMPLETE PLAYER <-> ADMIN SUPPORT CHAT =====
+from werkzeug.utils import secure_filename
+from flask import send_from_directory
+import uuid as _support_uuid
+import html as _support_html
+
+SUPPORT_UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "support_uploads")
+os.makedirs(SUPPORT_UPLOAD_DIR, exist_ok=True)
+SUPPORT_ALLOWED_EXT = {"png","jpg","jpeg","webp","pdf","txt","doc","docx","xls","xlsx"}
+SUPPORT_MAX_FILE = 5 * 1024 * 1024
+
+def _support_init():
+    con=db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS support_messages(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_id INTEGER NOT NULL,
+        sender TEXT NOT NULL,
+        topic TEXT DEFAULT 'Other',
+        request_ref TEXT DEFAULT '',
+        utr TEXT DEFAULT '',
+        amount REAL,
+        message TEXT DEFAULT '',
+        attachment_name TEXT DEFAULT '',
+        attachment_path TEXT DEFAULT '',
+        attachment_mime TEXT DEFAULT '',
+        is_read INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_support_player_id ON support_messages(player_id,id);
+    """)
+    con.commit(); con.close()
+
+_support_init()
+
+def _support_save_upload(file_obj):
+    if not file_obj or not getattr(file_obj, "filename", ""):
+        return "", "", ""
+    original = secure_filename(file_obj.filename)
+    if not original or "." not in original:
+        raise ValueError("Unsupported attachment")
+    ext = original.rsplit(".",1)[1].lower()
+    if ext not in SUPPORT_ALLOWED_EXT:
+        raise ValueError("Unsupported attachment type")
+    data = file_obj.read(SUPPORT_MAX_FILE + 1)
+    if len(data) > SUPPORT_MAX_FILE:
+        raise ValueError("Attachment maximum 5 MB")
+    stored = f"{_support_uuid.uuid4().hex}.{ext}"
+    path = os.path.join(SUPPORT_UPLOAD_DIR, stored)
+    with open(path, "wb") as f:
+        f.write(data)
+    return original, stored, (getattr(file_obj, "mimetype", "") or "application/octet-stream")
+
+@app.route("/api/support/messages", methods=["GET","POST"])
+def spin123_player_support_messages():
+    player=api_player()
+    if not player:
+        return jsonify({"ok":False,"error":"Unauthorized"}),401
+
+    if request.method=="GET":
+        con=db()
+        rows=con.execute("""
+            SELECT id,sender,topic,request_ref,utr,amount,message,
+                   attachment_name,attachment_path,attachment_mime,is_read,created_at
+            FROM support_messages WHERE player_id=? ORDER BY id ASC LIMIT 500
+        """,(player["id"],)).fetchall()
+        con.execute("UPDATE support_messages SET is_read=1 WHERE player_id=? AND sender='admin'",(player["id"],))
+        con.commit(); con.close()
+        data=[]
+        for r in rows:
+            x=dict(r)
+            x["attachment_url"] = (f"/api/support/attachment/{r['id']}" if r["attachment_path"] else "")
+            x.pop("attachment_path",None)
+            data.append(x)
+        return jsonify({"ok":True,"messages":data})
+
+    payload=request.get_json(silent=True) if request.is_json else request.form
+    payload=payload or {}
+    topic=str(payload.get("topic","Other")).strip() or "Other"
+    allowed_topics={"Deposit","Withdraw","Refund","Wallet","QR/UPI","VIP","Login/Account","Game Issue","Other"}
+    if topic not in allowed_topics:
+        topic="Other"
+    message=str(payload.get("message","")).strip()
+    request_ref=str(payload.get("request_ref","")).strip()[:120]
+    utr=str(payload.get("utr","")).strip()[:120]
+    try:
+        amount=float(payload.get("amount")) if str(payload.get("amount","")).strip() else None
+    except Exception:
+        amount=None
+
+    aname=apath=amime=""
+    try:
+        if not request.is_json:
+            aname,apath,amime=_support_save_upload(request.files.get("attachment"))
+    except ValueError as e:
+        return jsonify({"ok":False,"error":str(e)}),400
+
+    if not message and not apath:
+        return jsonify({"ok":False,"error":"Message or attachment required"}),400
+
+    con=db()
+    cur=con.execute("""
+        INSERT INTO support_messages(
+            player_id,sender,topic,request_ref,utr,amount,message,
+            attachment_name,attachment_path,attachment_mime,is_read
+        ) VALUES(?,'player',?,?,?,?,?,?,?,?,0)
+    """,(player["id"],topic,request_ref,utr,amount,message,aname,apath,amime))
+    con.commit(); mid=cur.lastrowid; con.close()
+    return jsonify({"ok":True,"message_id":mid,"status":"Sent"})
+
+@app.route("/api/support/attachment/<int:message_id>", methods=["GET"])
+def spin123_support_attachment(message_id):
+    con=db()
+    row=con.execute("SELECT player_id,attachment_name,attachment_path FROM support_messages WHERE id=?",(message_id,)).fetchone()
+    con.close()
+    if not row or not row["attachment_path"]:
+        return jsonify({"ok":False,"error":"Attachment not found"}),404
+    player=api_player()
+    if not session.get("admin") and (not player or player["id"] != row["player_id"]):
+        return jsonify({"ok":False,"error":"Unauthorized"}),401
+    return send_from_directory(SUPPORT_UPLOAD_DIR,row["attachment_path"],as_attachment=True,download_name=row["attachment_name"])
+
+@app.route("/support/<int:player_id>", methods=["GET","POST"])
+def spin123_admin_support_chat(player_id):
+    if not auth():
+        return redirect("/login")
+    con=db()
+    p=con.execute("SELECT id,username FROM players WHERE id=?",(player_id,)).fetchone()
+    if not p:
+        con.close()
+        return page("<div class=card>Player not found.</div>")
+
+    error=""
+    if request.method=="POST":
+        message=request.form.get("message","").strip()
+        topic=request.form.get("topic","Other").strip() or "Other"
+        request_ref=request.form.get("request_ref","").strip()[:120]
+        utr=request.form.get("utr","").strip()[:120]
+        try:
+            amount=float(request.form.get("amount")) if request.form.get("amount","").strip() else None
+        except Exception:
+            amount=None
+        aname=apath=amime=""
+        try:
+            aname,apath,amime=_support_save_upload(request.files.get("attachment"))
+        except ValueError as e:
+            error=str(e)
+        if not error:
+            if message or apath:
+                con.execute("""
+                    INSERT INTO support_messages(
+                        player_id,sender,topic,request_ref,utr,amount,message,
+                        attachment_name,attachment_path,attachment_mime,is_read
+                    ) VALUES(?,'admin',?,?,?,?,?,?,?,?,0)
+                """,(player_id,topic,request_ref,utr,amount,message,aname,apath,amime))
+                con.commit()
+            else:
+                error="Message or attachment required"
+
+    con.execute("UPDATE support_messages SET is_read=1 WHERE player_id=? AND sender='player'",(player_id,))
+    con.commit()
+    rows=con.execute("""
+        SELECT * FROM support_messages WHERE player_id=? ORDER BY id ASC LIMIT 500
+    """,(player_id,)).fetchall()
+    con.close()
+
+    body=f"<div class=card><a href='/support'>← Inbox</a><h2>User ID {p['id']} — {_support_html.escape(str(p['username']))}</h2></div>"
+    if error:
+        body+=f"<div class=card>{_support_html.escape(error)}</div>"
+    body+="<div class=card>"
+    for r in rows:
+        who="PLAYER" if r["sender"]=="player" else "ADMIN"
+        body+=f"<div style='padding:10px;margin:8px 0;background:#0b1728;border-radius:8px'><b>{who} · {_support_html.escape(str(r['topic']))}</b><br>"
+        if r["request_ref"]: body+=f"Ref: {_support_html.escape(str(r['request_ref']))}<br>"
+        if r["utr"]: body+=f"UTR: {_support_html.escape(str(r['utr']))}<br>"
+        if r["amount"] is not None: body+=f"Amount: ₹{r['amount']}<br>"
+        if r["message"]: body+=f"{_support_html.escape(str(r['message']))}<br>"
+        if r["attachment_path"]:
+            body+=f"<a href='/api/support/attachment/{r['id']}'>📎 {_support_html.escape(str(r['attachment_name']))}</a><br>"
+        body+=f"<small>{_support_html.escape(str(r['created_at']))}</small></div>"
+    body+="</div>"
+    body+=f"""
+    <div class=card><h3>Reply</h3>
+    <form method=post enctype="multipart/form-data">
+      <select name=topic>
+        <option>Deposit</option><option>Withdraw</option><option>Refund</option>
+        <option>Wallet</option><option>QR/UPI</option><option>VIP</option>
+        <option>Login/Account</option><option>Game Issue</option><option selected>Other</option>
+      </select>
+      <input name=request_ref placeholder="Request / Reference ID">
+      <input name=utr placeholder="UTR / Transaction ID">
+      <input name=amount type=number step=0.01 placeholder="Amount">
+      <input name=message placeholder="Reply message">
+      <input type=file name=attachment accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.doc,.docx,.xls,.xlsx">
+      <button>Send Reply</button>
+    </form></div>
+    """
+    return page(body)
+
+@app.route("/api/admin/support/<int:player_id>/messages", methods=["GET"])
+def spin123_admin_support_api(player_id):
+    if not auth():
+        return jsonify({"ok":False,"error":"Unauthorized"}),401
+    con=db()
+    rows=con.execute("""
+        SELECT id,sender,topic,request_ref,utr,amount,message,
+               attachment_name,attachment_mime,is_read,created_at
+        FROM support_messages WHERE player_id=? ORDER BY id ASC LIMIT 500
+    """,(player_id,)).fetchall()
+    con.close()
+    return jsonify({"ok":True,"player_id":player_id,"messages":[dict(r) for r in rows]})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

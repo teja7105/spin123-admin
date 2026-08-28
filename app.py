@@ -1712,3 +1712,62 @@ def migrate_money_requests():
 
 migrate_money_requests()
 # ===== END MONEY REQUESTS SCHEMA FIX =====
+
+
+# ===== FINANCE PAGE SCHEMA FIX =====
+def migrate_finance_schema():
+    con = db()
+
+    # money_requests के Finance/Withdraw fields
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS money_requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            amount INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'Pending',
+            reference TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cols = {
+        r["name"]
+        for r in con.execute("PRAGMA table_info(money_requests)").fetchall()
+    }
+
+    missing = {
+        "account_holder": "TEXT DEFAULT ''",
+        "account_number": "TEXT DEFAULT ''",
+        "ifsc": "TEXT DEFAULT ''",
+        "bank_name": "TEXT DEFAULT ''",
+        "reference": "TEXT DEFAULT ''",
+        "created_at": "TEXT"
+    }
+
+    for name, definition in missing.items():
+        if name not in cols:
+            con.execute(
+                f"ALTER TABLE money_requests ADD COLUMN {name} {definition}"
+            )
+
+    # Admin/Platform settlement history
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS admin_settlements(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount REAL NOT NULL DEFAULT 0,
+            account_holder TEXT DEFAULT '',
+            account_number TEXT DEFAULT '',
+            ifsc TEXT DEFAULT '',
+            bank_name TEXT DEFAULT '',
+            status TEXT DEFAULT 'Completed',
+            reference TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    con.commit()
+    con.close()
+
+migrate_finance_schema()
+# ===== END FINANCE PAGE SCHEMA FIX =====

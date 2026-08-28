@@ -114,7 +114,7 @@ td,th{padding:10px;border-bottom:1px solid #24364d;text-align:left}
 <a href="/">Dashboard</a>
 <a href="/players">Players</a>
 <a href="/games">Games</a>
-<a href="/payments">Payments</a><a href="/finance">Finance</a>
+<a href="/payments">Payments</a><a href="/finance">Finance</a><a href="/admin/direct-credit">Direct Credit</a>
 <a href="/notifications">Notifications</a>
 <a href="/support">Support</a>
 <a href="/history">History</a>
@@ -1651,10 +1651,6 @@ def legacy_probe_404(err):
 _legacy_ensure_tables()
 # ===== END LEGACY / PROBE BRIDGE =====
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
-
-
 # ===== PLAYERS AUTH SCHEMA MIGRATION =====
 def migrate_players_auth_schema():
     con = db()
@@ -1773,13 +1769,18 @@ migrate_finance_schema()
 # ===== END FINANCE PAGE SCHEMA FIX =====
 
 
-# ===== SPIN123 PAYMENT WEBHOOK + AUTO CREDIT =====
+
+# ===== SPIN123 COMPLETE PAYMENT FLOW =====
 import hmac as _spin_hmac
 import hashlib as _spin_hashlib
 import time as _spin_time
+import json as _spin_json
+import urllib.parse as _spin_urlparse
+import html as _spin_html
 
-def _spin123_payment_schema():
+def _spin123_payment_schema_v2():
     con = db()
+
     con.executescript("""
     CREATE TABLE IF NOT EXISTS payment_events(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1801,15 +1802,38 @@ def _spin123_payment_schema():
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     """)
+
+    cols = {r["name"] for r in con.execute("PRAGMA table_info(money_requests)").fetchall()}
+    additions = {
+        "utr": "TEXT DEFAULT ''",
+        "provider_status": "TEXT DEFAULT 'Pending'",
+        "payment_token": "TEXT DEFAULT ''",
+        "verified_at": "TEXT DEFAULT ''",
+        "provider_event_id": "TEXT DEFAULT ''",
+    }
+    for name, definition in additions.items():
+        if name not in cols:
+            con.execute(f"ALTER TABLE money_requests ADD COLUMN {name} {definition}")
+
+    con.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_money_requests_utr
+        ON money_requests(utr)
+        WHERE utr IS NOT NULL AND trim(utr) <> ''
+    """)
+    con.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_money_requests_payment_token
+        ON money_requests(payment_token)
+        WHERE payment_token IS NOT NULL AND trim(payment_token) <> ''
+    """)
     con.commit()
     con.close()
 
-_spin123_payment_schema()
+_spin123_payment_schema_v2()
 
 def _spin123_webhook_secret():
     return os.environ.get("PAYMENT_WEBHOOK_SECRET", "").encode()
 
-def _spin123_sig_message(data):
+def _spin123_sig_message(data, extended=False):
     fields = [
         str(data.get("event_id", "")),
         str(data.get("user_id", "")),
@@ -1818,14 +1842,380 @@ def _spin123_sig_message(data):
         str(data.get("status", "")),
         str(data.get("timestamp", "")),
     ]
+    if extended:
+        fields.append(str(data.get("request_id", "")))
     return "|".join(fields).encode()
 
 def _spin123_verify_signature(data, supplied):
     secret = _spin123_webhook_secret()
     if not secret or not supplied:
         return False
-    expected = _spin_hmac.new(secret, _spin123_sig_message(data), _spin_hashlib.sha256).hexdigest()
-    return _spin_hmac.compare_digest(expected, supplied)
+    candidates = [
+        _spin_hmac.new(secret, _spin123_sig_message(data, False), _spin_hashlib.sha256).hexdigest(),
+        _spin_hmac.new(secret, _spin123_sig_message(data, True), _spin_hashlib.sha256).hexdigest(),
+    ]
+    return any(_spin_hmac.compare_digest(x, supplied) for x in candidates)
+
+def _spin123_success_status(status):
+    return str(status or "").upper() in {"SUCCESS", "SUCCESSFUL", "PAID", "COMPLETED", "VERIFIED"}
+
+def _spin123_credit_request(con, req, utr, event_id):
+    """Credit exactly once. Caller must be inside BEGIN IMMEDIATE transaction."""
+    fresh = con.execute(
+        "SELECT id,player_id,amount,status,utr FROM money_requests WHERE id=?",
+        (req["id"],)
+    ).fetchone()
+    if not fresh:
+        return False, "Request not found"
+
+    if fresh["status"] == "Approved":
+        return False, "Already credited"
+    if fresh["status"] != "Pending":
+        return False, "Request is not pending"
+
+    con.execute(
+        "UPDATE players SET balance=balance+? WHERE id=?",
+        (fresh["amount"], fresh["player_id"])
+    )
+    con.execute("""
+        UPDATE money_requests
+        SET status='Approved',
+            utr=?,
+            reference=?,
+            provider_status='Verified',
+            verified_at=CURRENT_TIMESTAMP,
+            provider_event_id=?
+        WHERE id=? AND status='Pending'
+    """, (utr, utr, event_id, fresh["id"]))
+
+    try:
+        con.execute("""
+            INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
+            VALUES(?,'Deposit',?,'Approved',?)
+        """, (fresh["player_id"], fresh["amount"], utr))
+    except Exception:
+        pass
+    return True, "Credited"
+
+def _spin123_select_payment_config(amount):
+    con = db()
+    rr = con.execute("""
+        SELECT min_amount,max_amount,upi_id,qr_url,account_name,note
+        FROM qr_ranges
+        WHERE enabled=1 AND ? BETWEEN min_amount AND max_amount
+        ORDER BY min_amount ASC LIMIT 1
+    """, (amount,)).fetchone()
+
+    if rr and (rr["upi_id"] or rr["qr_url"]):
+        cfg = dict(rr)
+    else:
+        row = con.execute(
+            "SELECT upi_id,qr_url,account_name,note FROM payment_settings WHERE id=1"
+        ).fetchone()
+        cfg = dict(row) if row else {
+            "upi_id":"", "qr_url":"", "account_name":"", "note":""
+        }
+    con.close()
+    return cfg
+
+def _spin123_upi_links(upi_id, account_name, amount, request_id):
+    params = {
+        "pa": upi_id,
+        "pn": account_name or "Spin123",
+        "am": f"{float(amount):.2f}",
+        "cu": "INR",
+        "tn": f"Spin123 Deposit #{request_id}",
+        "tr": f"SPIN123-{request_id}",
+    }
+    query = _spin_urlparse.urlencode(params)
+    upi_uri = "upi://pay?" + query
+
+    def intent(package_name):
+        return (
+            "intent://pay?" + query +
+            "#Intent;scheme=upi;package=" + package_name + ";end"
+        )
+
+    return {
+        "upi_uri": upi_uri,
+        "google_pay": intent("com.google.android.apps.nbu.paisa.user"),
+        "phonepe": intent("com.phonepe.app"),
+        "paytm": intent("net.one97.paytm"),
+    }
+
+def _spin123_validate_utr(utr):
+    utr = str(utr or "").strip().upper()
+    if not (6 <= len(utr) <= 40):
+        return ""
+    if not all(c.isalnum() or c in "-_" for c in utr):
+        return ""
+    return utr
+
+@app.route("/api/deposit/prepare", methods=["POST"])
+def spin123_deposit_prepare():
+    player = api_player()
+    if not player:
+        return jsonify({"ok":False,"error":"Unauthorized"}),401
+
+    data = request.get_json(silent=True) or request.form or {}
+    try:
+        amount = int(data.get("amount", 0))
+    except Exception:
+        amount = 0
+    if amount <= 0:
+        return jsonify({"ok":False,"error":"Invalid amount"}),400
+
+    cfg = _spin123_select_payment_config(amount)
+    if not cfg.get("upi_id") and not cfg.get("qr_url"):
+        return jsonify({"ok":False,"error":"Payment QR/UPI is not configured"}),503
+
+    token = secrets.token_urlsafe(24)
+    con = db()
+    cur = con.execute("""
+        INSERT INTO money_requests(
+            player_id,type,amount,status,reference,utr,
+            provider_status,payment_token
+        )
+        VALUES(?,'Deposit',?,'Pending','','','Pending',?)
+    """, (player["id"], amount, token))
+    request_id = cur.lastrowid
+    con.commit()
+    con.close()
+
+    links = _spin123_upi_links(
+        cfg.get("upi_id",""),
+        cfg.get("account_name",""),
+        amount,
+        request_id
+    )
+    payment_url = request.host_url.rstrip("/") + "/pay/" + token
+
+    return jsonify({
+        "ok": True,
+        "request_id": request_id,
+        "status": "Pending",
+        "payment_url": payment_url,
+        "amount": amount,
+        "upi_id": cfg.get("upi_id",""),
+        "account_name": cfg.get("account_name",""),
+        "qr_url": cfg.get("qr_url",""),
+        "note": cfg.get("note",""),
+        "upi": links
+    })
+
+def _spin123_submit_utr_for_request(req_id, player_id, utr):
+    utr = _spin123_validate_utr(utr)
+    if not utr:
+        return {"ok":False,"error":"Invalid UTR"},400
+
+    con = db()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        req = con.execute("""
+            SELECT id,player_id,amount,status,utr
+            FROM money_requests
+            WHERE id=? AND type='Deposit'
+        """, (req_id,)).fetchone()
+
+        if not req or int(req["player_id"]) != int(player_id):
+            con.rollback(); con.close()
+            return {"ok":False,"error":"Deposit request not found"},404
+
+        if req["status"] == "Approved":
+            bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()[0]
+            con.rollback(); con.close()
+            return {"ok":True,"status":"Approved","credited":True,"balance":bal},200
+
+        duplicate = con.execute("""
+            SELECT id,player_id FROM money_requests
+            WHERE utr=? AND id<>?
+        """, (utr, req_id)).fetchone()
+        if duplicate:
+            con.rollback(); con.close()
+            return {"ok":False,"error":"UTR already used"},409
+
+        con.execute("""
+            UPDATE money_requests
+            SET utr=?, reference=?, provider_status='Pending'
+            WHERE id=?
+        """, (utr, utr, req_id))
+
+        event = con.execute("""
+            SELECT id,event_id,player_id,amount,provider_status,credited
+            FROM payment_events
+            WHERE utr=?
+        """, (utr,)).fetchone()
+
+        credited = False
+        if (event and _spin123_success_status(event["provider_status"])
+                and int(event["player_id"]) == int(player_id)
+                and float(event["amount"]) == float(req["amount"])):
+            credited, _ = _spin123_credit_request(con, req, utr, event["event_id"])
+            if credited:
+                con.execute("UPDATE payment_events SET credited=1 WHERE id=?", (event["id"],))
+
+        con.commit()
+        bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()[0]
+        state = con.execute(
+            "SELECT status,provider_status FROM money_requests WHERE id=?",
+            (req_id,)
+        ).fetchone()
+        con.close()
+
+        return {
+            "ok":True,
+            "request_id":req_id,
+            "utr":utr,
+            "status":state["status"],
+            "provider_status":state["provider_status"],
+            "credited":bool(credited),
+            "balance":bal
+        },200
+    except sqlite3.IntegrityError:
+        con.rollback(); con.close()
+        return {"ok":False,"error":"UTR already used"},409
+    except Exception as e:
+        con.rollback(); con.close()
+        return {"ok":False,"error":str(e)},500
+
+@app.route("/api/deposit/<int:req_id>/utr", methods=["POST"])
+def spin123_submit_utr(req_id):
+    player = api_player()
+    if not player:
+        return jsonify({"ok":False,"error":"Unauthorized"}),401
+    data = request.get_json(silent=True) or request.form or {}
+    result, code = _spin123_submit_utr_for_request(req_id, player["id"], data.get("utr",""))
+    return jsonify(result), code
+
+@app.route("/api/deposit/<int:req_id>/status", methods=["GET"])
+def spin123_deposit_status(req_id):
+    player = api_player()
+    if not player:
+        return jsonify({"ok":False,"error":"Unauthorized"}),401
+    con = db()
+    row = con.execute("""
+        SELECT id,amount,status,utr,provider_status,verified_at
+        FROM money_requests WHERE id=? AND player_id=? AND type='Deposit'
+    """, (req_id, player["id"])).fetchone()
+    con.close()
+    if not row:
+        return jsonify({"ok":False,"error":"Deposit request not found"}),404
+    return jsonify({"ok":True, **dict(row)})
+
+@app.route("/pay/<token>", methods=["GET"])
+def spin123_payment_page(token):
+    con = db()
+    req = con.execute("""
+        SELECT m.id,m.player_id,m.amount,m.status,m.utr,m.provider_status,
+               p.username
+        FROM money_requests m
+        LEFT JOIN players p ON p.id=m.player_id
+        WHERE m.payment_token=? AND m.type='Deposit'
+    """, (token,)).fetchone()
+    con.close()
+    if not req:
+        return page("<div class=card>Payment request not found.</div>"),404
+
+    cfg = _spin123_select_payment_config(req["amount"])
+    links = _spin123_upi_links(
+        cfg.get("upi_id",""),
+        cfg.get("account_name",""),
+        req["amount"],
+        req["id"]
+    )
+    qr = cfg.get("qr_url","")
+    qr_html = (
+        f'<img src="{_spin_html.escape(qr, quote=True)}" '
+        'style="width:240px;max-width:85%;border-radius:14px;background:white;padding:8px">'
+        if qr else ""
+    )
+    safe_upi = _spin_html.escape(cfg.get("upi_id",""))
+    safe_name = _spin_html.escape(cfg.get("account_name",""))
+    safe_token = _spin_html.escape(token, quote=True)
+    safe_gpay = _spin_html.escape(links["google_pay"], quote=True)
+    safe_phonepe = _spin_html.escape(links["phonepe"], quote=True)
+    safe_paytm = _spin_html.escape(links["paytm"], quote=True)
+    safe_upi_uri = _spin_html.escape(links["upi_uri"], quote=True)
+
+    return page(f"""
+    <div class=card style="text-align:center">
+      <h2>Deposit ₹{req['amount']}</h2>
+      <p>User: {_spin_html.escape(str(req['username'] or req['player_id']))}</p>
+      {qr_html}
+      <p><b>{safe_name}</b><br>{safe_upi}</p>
+
+      <a href="{safe_gpay}"><button>Google Pay</button></a>
+      <a href="{safe_phonepe}"><button>PhonePe</button></a>
+      <a href="{safe_paytm}"><button>Paytm</button></a>
+      <br>
+      <a href="{safe_upi_uri}"><button>Other UPI App</button></a>
+
+      <hr style="margin:18px 0;border-color:#24364d">
+      <p>Payment complete होने के बाद UTR डालें.</p>
+      <form method=post action="/pay/{safe_token}/utr">
+        <input name=utr placeholder="UTR / Transaction ID" required>
+        <button>Verify Payment</button>
+      </form>
+      <p id=status>Current status: {_spin_html.escape(str(req['status']))}</p>
+    </div>
+    <script>
+    async function refreshStatus(){{
+      try {{
+        const r=await fetch("/pay/{safe_token}/status");
+        const j=await r.json();
+        if(j.ok){{
+          document.getElementById("status").innerText =
+            "Status: " + j.status + " / " + j.provider_status;
+          if(j.status==="Approved"){{
+            document.getElementById("status").innerText =
+              "✅ Payment Successful - Wallet credited";
+          }}
+        }}
+      }} catch(e) {{}}
+    }}
+    document.addEventListener("visibilitychange",()=>{{
+      if(!document.hidden) refreshStatus();
+    }});
+    setInterval(refreshStatus,5000);
+    </script>
+    """)
+
+@app.route("/pay/<token>/utr", methods=["POST"])
+def spin123_payment_page_submit_utr(token):
+    con = db()
+    req = con.execute(
+        "SELECT id,player_id FROM money_requests WHERE payment_token=? AND type='Deposit'",
+        (token,)
+    ).fetchone()
+    con.close()
+    if not req:
+        return page("<div class=card>Payment request not found.</div>"),404
+
+    result, code = _spin123_submit_utr_for_request(
+        req["id"], req["player_id"], request.form.get("utr","")
+    )
+    if result.get("credited"):
+        msg = "✅ Payment verified. Wallet credited successfully."
+    elif result.get("ok"):
+        msg = "⏳ UTR saved. Provider verification pending."
+    else:
+        msg = "❌ " + _spin_html.escape(str(result.get("error","Request failed")))
+    return page(
+        f'<div class=card><h3>{msg}</h3>'
+        f'<a href="/pay/{_spin_html.escape(token, quote=True)}"><button>Back</button></a></div>'
+    ), code
+
+@app.route("/pay/<token>/status", methods=["GET"])
+def spin123_payment_page_status(token):
+    con = db()
+    row = con.execute("""
+        SELECT id,amount,status,provider_status,verified_at
+        FROM money_requests WHERE payment_token=? AND type='Deposit'
+    """, (token,)).fetchone()
+    con.close()
+    if not row:
+        return jsonify({"ok":False,"error":"Not found"}),404
+    return jsonify({"ok":True, **dict(row)})
 
 @app.route("/api/payment/webhook", methods=["POST"])
 def spin123_payment_webhook():
@@ -1833,146 +2223,290 @@ def spin123_payment_webhook():
     sig = request.headers.get("X-Spin123-Signature", "").strip()
 
     if not _spin123_verify_signature(data, sig):
-        return jsonify({"ok": False, "error": "Invalid webhook signature"}), 401
+        return jsonify({"ok":False,"error":"Invalid webhook signature"}),401
 
     try:
         event_id = str(data["event_id"]).strip()
         player_id = int(data["user_id"])
         amount = float(data["amount"])
-        utr = str(data.get("utr", "")).strip()
-        status = str(data.get("status", "")).strip().upper()
-        ts = int(data.get("timestamp", 0))
+        utr = _spin123_validate_utr(data.get("utr",""))
+        status = str(data.get("status","")).strip().upper()
+        ts = int(data.get("timestamp",0))
+        request_id = int(data.get("request_id",0) or 0)
     except Exception:
-        return jsonify({"ok": False, "error": "Invalid payload"}), 400
+        return jsonify({"ok":False,"error":"Invalid payload"}),400
 
     if not event_id or amount <= 0 or not utr:
-        return jsonify({"ok": False, "error": "Missing event_id/amount/utr"}), 400
-
+        return jsonify({"ok":False,"error":"Missing/invalid event_id, amount or UTR"}),400
     if ts and abs(int(_spin_time.time()) - ts) > 900:
-        return jsonify({"ok": False, "error": "Stale webhook"}), 400
+        return jsonify({"ok":False,"error":"Stale webhook"}),400
 
     con = db()
-    player = con.execute("SELECT id FROM players WHERE id=?", (player_id,)).fetchone()
-    if not player:
-        con.close()
-        return jsonify({"ok": False, "error": "Unknown user_id"}), 404
+    try:
+        con.execute("BEGIN IMMEDIATE")
 
-    old = con.execute(
-        "SELECT id,credited,provider_status FROM payment_events WHERE event_id=? OR utr=?",
-        (event_id, utr)
-    ).fetchone()
+        existing = con.execute(
+            "SELECT id,credited,provider_status FROM payment_events WHERE event_id=? OR utr=?",
+            (event_id, utr)
+        ).fetchone()
+        if existing:
+            con.rollback(); con.close()
+            return jsonify({
+                "ok":True,
+                "duplicate":True,
+                "credited":bool(existing["credited"]),
+                "status":existing["provider_status"]
+            })
 
-    if old:
+        player = con.execute("SELECT id FROM players WHERE id=?", (player_id,)).fetchone()
+        if not player:
+            con.rollback(); con.close()
+            return jsonify({"ok":False,"error":"Unknown user_id"}),404
+
+        con.execute("""
+            INSERT INTO payment_events(
+                event_id,player_id,amount,utr,provider_status,credited,raw_payload
+            ) VALUES(?,?,?,?,?,?,?)
+        """, (
+            event_id, player_id, amount, utr, status, 0,
+            _spin_json.dumps(data, separators=(",",":"))
+        ))
+
+        req = None
+        if request_id:
+            req = con.execute("""
+                SELECT id,player_id,amount,status,utr
+                FROM money_requests
+                WHERE id=? AND type='Deposit' AND player_id=? AND amount=?
+            """, (request_id, player_id, amount)).fetchone()
+
+        if not req:
+            req = con.execute("""
+                SELECT id,player_id,amount,status,utr
+                FROM money_requests
+                WHERE type='Deposit' AND player_id=? AND amount=? AND utr=?
+                ORDER BY id DESC LIMIT 1
+            """, (player_id, amount, utr)).fetchone()
+
+        if not req:
+            candidates = con.execute("""
+                SELECT id,player_id,amount,status,utr
+                FROM money_requests
+                WHERE type='Deposit' AND player_id=? AND amount=? AND status='Pending'
+                ORDER BY id DESC LIMIT 2
+            """, (player_id, amount)).fetchall()
+            if len(candidates) == 1:
+                req = candidates[0]
+
+        credited = False
+        if req and _spin123_success_status(status):
+            credited, _ = _spin123_credit_request(con, req, utr, event_id)
+            if credited:
+                con.execute(
+                    "UPDATE payment_events SET credited=1 WHERE event_id=?",
+                    (event_id,)
+                )
+        elif req:
+            con.execute("""
+                UPDATE money_requests
+                SET utr=?,reference=?,provider_status=?
+                WHERE id=? AND status='Pending'
+            """, (utr, utr, status or "Pending", req["id"]))
+
+        con.commit()
+        bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()[0]
         con.close()
         return jsonify({
-            "ok": True,
-            "duplicate": True,
-            "credited": bool(old["credited"]),
-            "status": old["provider_status"]
+            "ok":True,
+            "event_id":event_id,
+            "user_id":player_id,
+            "utr":utr,
+            "provider_status":status,
+            "matched_request_id": req["id"] if req else None,
+            "credited":bool(credited),
+            "balance":bal
         })
-
-    credited = 0
-    success_states = {"SUCCESS", "SUCCESSFUL", "PAID", "COMPLETED", "VERIFIED"}
-
-    con.execute(
-        """INSERT INTO payment_events(event_id,player_id,amount,utr,provider_status,credited,raw_payload)
-           VALUES(?,?,?,?,?,?,?)""",
-        (event_id, player_id, amount, utr, status, 0, json.dumps(data, separators=(",", ":")))
-    )
-
-    if status in success_states:
-        con.execute("UPDATE players SET balance=balance+? WHERE id=?", (amount, player_id))
-        credited = 1
-        con.execute("UPDATE payment_events SET credited=1 WHERE event_id=?", (event_id,))
-        try:
-            con.execute(
-                """INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
-                   VALUES(?,'Deposit',?,'Approved',?)""",
-                (player_id, amount, utr)
-            )
-        except Exception:
-            pass
-
-        try:
-            row = con.execute(
-                """SELECT id FROM money_requests
-                   WHERE player_id=? AND type='Deposit' AND status='Pending' AND amount=?
-                   ORDER BY id ASC LIMIT 1""",
-                (player_id, amount)
-            ).fetchone()
-            if row:
-                con.execute(
-                    "UPDATE money_requests SET status='Approved', reference=? WHERE id=?",
-                    (utr, row["id"])
-                )
-        except Exception:
-            pass
-
-    con.commit()
-    bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()["balance"]
-    con.close()
-
-    return jsonify({
-        "ok": True,
-        "event_id": event_id,
-        "user_id": player_id,
-        "utr": utr,
-        "provider_status": status,
-        "credited": bool(credited),
-        "balance": bal
-    })
+    except sqlite3.IntegrityError:
+        con.rollback(); con.close()
+        return jsonify({"ok":True,"duplicate":True,"credited":False}),200
+    except Exception as e:
+        con.rollback(); con.close()
+        return jsonify({"ok":False,"error":str(e)}),500
 
 @app.route("/api/admin/direct-credit", methods=["POST"])
 def spin123_admin_direct_credit():
     if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        return jsonify({"ok":False,"error":"Unauthorized"}),401
 
     data = request.get_json(silent=True) or request.form or {}
     try:
-        player_id = int(data.get("user_id", 0))
-        amount = float(data.get("amount", 0))
+        player_id = int(data.get("user_id",0))
+        amount = float(data.get("amount",0))
     except Exception:
-        return jsonify({"ok": False, "error": "Invalid user_id/amount"}), 400
+        return jsonify({"ok":False,"error":"Invalid user_id/amount"}),400
 
-    note = str(data.get("note", "")).strip()
+    note = str(data.get("note","")).strip()
     if player_id <= 0 or amount <= 0:
-        return jsonify({"ok": False, "error": "Invalid user_id/amount"}), 400
+        return jsonify({"ok":False,"error":"Invalid user_id/amount"}),400
 
     con = db()
-    player = con.execute("SELECT id FROM players WHERE id=?", (player_id,)).fetchone()
-    if not player:
-        con.close()
-        return jsonify({"ok": False, "error": "Player not found"}), 404
-
-    con.execute("UPDATE players SET balance=balance+? WHERE id=?", (amount, player_id))
-    con.execute(
-        "INSERT INTO admin_direct_credits(player_id,amount,note) VALUES(?,?,?)",
-        (player_id, amount, note)
-    )
     try:
-        con.execute(
-            """INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
-               VALUES(?,'AdminCredit',?,'Approved',?)""",
-            (player_id, amount, note or "ADMIN-DIRECT-CREDIT")
-        )
-    except Exception:
-        pass
+        con.execute("BEGIN IMMEDIATE")
+        player = con.execute(
+            "SELECT id,username,balance FROM players WHERE id=?",
+            (player_id,)
+        ).fetchone()
+        if not player:
+            con.rollback(); con.close()
+            return jsonify({"ok":False,"error":"Player not found"}),404
 
-    con.commit()
-    bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()["balance"]
+        con.execute("UPDATE players SET balance=balance+? WHERE id=?", (amount, player_id))
+        con.execute("UPDATE platform_account SET balance=balance-? WHERE id=1", (amount,))
+        platform_balance = con.execute(
+            "SELECT balance FROM platform_account WHERE id=1"
+        ).fetchone()[0]
+
+        con.execute(
+            "INSERT INTO admin_direct_credits(player_id,amount,note) VALUES(?,?,?)",
+            (player_id, amount, note)
+        )
+        con.execute("""
+            INSERT INTO platform_ledger(type,amount,balance_after,note)
+            VALUES('DirectPlayerCredit',?,?,?)
+        """, (-amount, platform_balance, note or f"Direct credit to player {player_id}"))
+        try:
+            con.execute("""
+                INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
+                VALUES(?,'AdminCredit',?,'Approved',?)
+            """, (player_id, amount, note or "ADMIN-DIRECT-CREDIT"))
+        except Exception:
+            pass
+
+        con.commit()
+        balance = con.execute(
+            "SELECT balance FROM players WHERE id=?", (player_id,)
+        ).fetchone()[0]
+        con.close()
+        return jsonify({
+            "ok":True,
+            "user_id":player_id,
+            "credited":amount,
+            "balance":balance,
+            "platform_balance":platform_balance
+        })
+    except Exception as e:
+        con.rollback(); con.close()
+        return jsonify({"ok":False,"error":str(e)}),500
+
+@app.route("/admin/direct-credit", methods=["GET","POST"])
+def spin123_admin_direct_credit_page():
+    if not session.get("admin"):
+        return redirect("/login")
+
+    message = ""
+    if request.method == "POST":
+        data = request.form
+        try:
+            player_id = int(data.get("user_id",0))
+            amount = float(data.get("amount",0))
+        except Exception:
+            player_id, amount = 0, 0
+
+        note = str(data.get("note","")).strip()
+        if player_id > 0 and amount > 0:
+            con = db()
+            try:
+                con.execute("BEGIN IMMEDIATE")
+                player = con.execute(
+                    "SELECT id,username FROM players WHERE id=?", (player_id,)
+                ).fetchone()
+                if not player:
+                    message = "❌ Player not found"
+                    con.rollback()
+                else:
+                    con.execute("UPDATE players SET balance=balance+? WHERE id=?", (amount,player_id))
+                    con.execute("UPDATE platform_account SET balance=balance-? WHERE id=1",(amount,))
+                    pbal = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()[0]
+                    con.execute(
+                        "INSERT INTO admin_direct_credits(player_id,amount,note) VALUES(?,?,?)",
+                        (player_id,amount,note)
+                    )
+                    con.execute("""
+                        INSERT INTO platform_ledger(type,amount,balance_after,note)
+                        VALUES('DirectPlayerCredit',?,?,?)
+                    """,(-amount,pbal,note or f"Direct credit to player {player_id}"))
+                    try:
+                        con.execute("""
+                            INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
+                            VALUES(?,'AdminCredit',?,'Approved',?)
+                        """,(player_id,amount,note or "ADMIN-DIRECT-CREDIT"))
+                    except Exception:
+                        pass
+                    con.commit()
+                    message = f"✅ ₹{amount:.2f} credited to User ID {player_id}"
+            except Exception as e:
+                con.rollback()
+                message = "❌ " + _spin_html.escape(str(e))
+            finally:
+                con.close()
+        else:
+            message = "❌ Valid User ID and amount required"
+
+    con = db()
+    bal = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()
+    rows = con.execute("""
+        SELECT d.id,d.player_id,p.username,d.amount,d.note,d.created_at
+        FROM admin_direct_credits d
+        LEFT JOIN players p ON p.id=d.player_id
+        ORDER BY d.id DESC LIMIT 100
+    """).fetchall()
     con.close()
 
-    return jsonify({"ok": True, "user_id": player_id, "credited": amount, "balance": bal})
+    history = ""
+    for r in rows:
+        history += (
+            f"<tr><td>{r['id']}</td><td>{r['player_id']}</td>"
+            f"<td>{_spin_html.escape(str(r['username'] or ''))}</td>"
+            f"<td>₹{float(r['amount']):.2f}</td>"
+            f"<td>{_spin_html.escape(str(r['note'] or ''))}</td>"
+            f"<td>{_spin_html.escape(str(r['created_at'] or ''))}</td></tr>"
+        )
+
+    return page(f"""
+      <div class=card>
+        <h2>Admin Direct User Credit</h2>
+        <p>Platform balance: ₹{float(bal[0] if bal else 0):.2f}</p>
+        <p>{message}</p>
+        <form method=post>
+          <input name=user_id type=number min=1 placeholder="User ID" required>
+          <input name=amount type=number min=1 step=0.01 placeholder="Amount" required>
+          <input name=note placeholder="Note / Reference">
+          <button>Credit User Wallet</button>
+        </form>
+      </div>
+      <div class=card>
+        <h3>Direct Credit History</h3>
+        <div style="overflow:auto"><table>
+          <tr><th>ID</th><th>User ID</th><th>Player</th><th>Amount</th><th>Note</th><th>Created</th></tr>
+          {history}
+        </table></div>
+      </div>
+    """)
 
 @app.route("/api/admin/payment-events", methods=["GET"])
 def spin123_admin_payment_events():
     if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+        return jsonify({"ok":False,"error":"Unauthorized"}),401
     con = db()
-    rows = con.execute(
-        """SELECT id,event_id,player_id,amount,utr,provider_status,credited,created_at
-           FROM payment_events ORDER BY id DESC LIMIT 500"""
-    ).fetchall()
+    rows = con.execute("""
+        SELECT id,event_id,player_id,amount,utr,provider_status,credited,created_at
+        FROM payment_events ORDER BY id DESC LIMIT 500
+    """).fetchall()
     con.close()
-    return jsonify({"ok": True, "rows": [dict(r) for r in rows]})
-# ===== END SPIN123 PAYMENT WEBHOOK + AUTO CREDIT =====
+    return jsonify({"ok":True,"rows":[dict(r) for r in rows]})
+# ===== END SPIN123 COMPLETE PAYMENT FLOW =====
+
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)

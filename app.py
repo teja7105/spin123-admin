@@ -2788,5 +2788,49 @@ def spin123_admin_support_api(player_id):
     con.close()
     return jsonify({"ok":True,"player_id":player_id,"messages":[dict(r) for r in rows]})
 
+
+# ===== SPIN123 APK SINGLE-ADMIN CONFIG =====
+
+@app.route("/version.manifest", methods=["GET"])
+def spin123_version_manifest():
+    return jsonify({
+        "version": "1.2.1.0",
+        "packageUrl": "http://ifs.168125.com/GameX/1.2.1.0/Main",
+        "remoteVersionUrl": "https://spin123-admin.onrender.com/version.manifest",
+        "remoteManifestUrl": "https://spin123-admin.onrender.com/project.manifest",
+        "androidAppUrl": "https://spin123-admin.onrender.com"
+    })
+
+
+@app.route("/project.manifest", methods=["GET"])
+def spin123_project_manifest():
+    return jsonify({
+        "version": "1.2.1.0",
+        "packageUrl": "http://ifs.168125.com/GameX/1.2.1.0/Main",
+        "remoteVersionUrl": "https://spin123-admin.onrender.com/version.manifest",
+        "remoteManifestUrl": "https://spin123-admin.onrender.com/project.manifest",
+        "androidAppUrl": "https://spin123-admin.onrender.com",
+        "assets": {},
+        "searchPaths": []
+    })
+
+
+@app.route("/api/gamerule", methods=["GET","POST"])
+@app.route("/gamerule", methods=["GET","POST"])
+def spin123_apk_gamerule():
+    return jsonify({
+        "ok": True,
+        "status": 1,
+        "enabled": 1,
+        "maintenance": False,
+        "mode": "normal",
+        "androidAppUrl": "https://spin123-admin.onrender.com",
+        "remoteVersionUrl": "https://spin123-admin.onrender.com/version.manifest",
+        "remoteManifestUrl": "https://spin123-admin.onrender.com/project.manifest"
+    })
+
+# ===== END SPIN123 APK SINGLE-ADMIN CONFIG =====
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

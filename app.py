@@ -1,5 +1,5 @@
 import base64
-from flask import Flask, request, redirect, session, render_template_string
+from flask import Flask, request, redirect, session, render_template_string, jsonify
 import sqlite3, os
 
 app = Flask(__name__)
@@ -7,13 +7,8 @@ app.secret_key = os.environ.get("SECRET_KEY","change-this-secret-key")
 DB="admin.db"
 
 def db():
-    con=sqlite3.connect(DB, timeout=30)
+    con=sqlite3.connect(DB)
     con.row_factory=sqlite3.Row
-    con.execute("PRAGMA busy_timeout=30000")
-    try:
-        con.execute("PRAGMA journal_mode=WAL")
-    except Exception:
-        pass
     return con
 
 def init():
@@ -114,7 +109,7 @@ td,th{padding:10px;border-bottom:1px solid #24364d;text-align:left}
 <a href="/">Dashboard</a>
 <a href="/players">Players</a>
 <a href="/games">Games</a>
-<a href="/payments">Payments</a><a href="/finance">Finance</a><a href="/admin/direct-credit">Direct Credit</a>
+<a href="/payments">Payments</a><a href="/finance">Finance</a>
 <a href="/notifications">Notifications</a>
 <a href="/support">Support</a>
 <a href="/history">History</a>
@@ -221,34 +216,6 @@ def payments():
                     (request.form["player"],request.form["type"],request.form["amount"]))
         con.commit()
     rows=con.execute("SELECT * FROM payments ORDER BY id DESC").fetchall()
-
-    # ===== PAYMENT TOTAL SUMMARY =====
-    try:
-        total_deposit = float(con.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE type='Deposit'"
-        ).fetchone()[0] or 0)
-        total_withdraw = float(con.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE type='Withdraw'"
-        ).fetchone()[0] or 0)
-        total_refund = float(con.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE type='Refund'"
-        ).fetchone()[0] or 0)
-        total_pending = float(con.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE status='Pending'"
-        ).fetchone()[0] or 0)
-        total_approved = float(con.execute(
-            "SELECT COALESCE(SUM(amount),0) FROM money_requests WHERE status='Approved'"
-        ).fetchone()[0] or 0)
-    except Exception:
-        total_deposit = total_withdraw = total_refund = 0.0
-        total_pending = total_approved = 0.0
-
-    try:
-        prow = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()
-        platform_balance = float(prow[0] if prow else 0)
-    except Exception:
-        platform_balance = 0.0
-
     con.close()
     cfgcon=db()
     cfg=cfgcon.execute("SELECT upi_id,qr_url,account_name,note FROM payment_settings WHERE id=1").fetchone()
@@ -309,21 +276,7 @@ def payments():
         <p><b>UPI ID:</b> {upi}</p>"""
     qr_card+="</div>"
 
-    summary_card=f"""
-<div class=card>
-<h2>Payment Amount Summary</h2>
-<div class=grid>
-  <div class=card><b>Total Deposits</b><h2>₹{total_deposit:,.2f}</h2></div>
-  <div class=card><b>Total Withdrawals</b><h2>₹{total_withdraw:,.2f}</h2></div>
-  <div class=card><b>Total Refunds</b><h2>₹{total_refund:,.2f}</h2></div>
-  <div class=card><b>Pending Amount</b><h2>₹{total_pending:,.2f}</h2></div>
-  <div class=card><b>Approved Amount</b><h2>₹{total_approved:,.2f}</h2></div>
-  <div class=card><b>Platform Balance</b><h2>₹{platform_balance:,.2f}</h2></div>
-</div>
-</div>
-"""
-
-    html=summary_card+qr_card+"""
+    html=qr_card+"""
 <div class=card>
 <h3>Temporary Unlimited Withdrawal</h3>
 <p>Time खत्म होने पर 80% withdrawal rule अपने आप वापस लागू होगा.</p>
@@ -456,32 +409,7 @@ def notifications():
 @app.route("/support")
 def support():
     if not auth(): return redirect("/login")
-    con=db()
-    rows=con.execute("""
-        SELECT p.id,p.username,
-               COUNT(sm.id) AS message_count,
-               MAX(sm.created_at) AS last_message,
-               SUM(CASE WHEN sm.sender='player' AND sm.is_read=0 THEN 1 ELSE 0 END) AS unread
-        FROM players p
-        JOIN support_messages sm ON sm.player_id=p.id
-        GROUP BY p.id,p.username
-        ORDER BY last_message DESC
-    """).fetchall()
-    con.close()
-    import html
-    body="<div class=card><h2>Player Support Inbox</h2><p>Text, image, PDF/document support chat.</p></div>"
-    if not rows:
-        body += "<div class=card>No support conversations yet.</div>"
-    for r in rows:
-        body += (
-            "<div class=card>"
-            f"<b>User ID {r['id']} — {html.escape(str(r['username']))}</b><br>"
-            f"Messages: {r['message_count']} &nbsp; Unread: {r['unread'] or 0}<br>"
-            f"Last: {html.escape(str(r['last_message'] or ''))}<br><br>"
-            f"<a href='/support/{r['id']}'><button>Open Chat</button></a>"
-            "</div>"
-        )
-    return page(body)
+    return page("<div class=card><h3>Customer Support</h3>Support module ready for backend integration.</div>")
 
 @app.route("/history")
 def history():
@@ -1093,11 +1021,32 @@ def finance_panel():
     import html
     con = db()
 
-    # Schema initialized at startup. Keep this GET read-only
-    # to avoid SQLite write locks under concurrent requests.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS platform_wallet(
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            balance REAL NOT NULL DEFAULT 0
+        )
+    """)
+    con.execute(
+        "INSERT OR IGNORE INTO platform_wallet(id,balance) VALUES(1,0)"
+    )
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS admin_settlements(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount REAL NOT NULL,
+            account_holder TEXT NOT NULL,
+            account_number TEXT NOT NULL,
+            ifsc TEXT NOT NULL,
+            bank_name TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'Pending',
+            reference TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     wallet = con.execute(
-        "SELECT balance FROM platform_account WHERE id=1"
+        "SELECT balance FROM platform_wallet WHERE id=1"
     ).fetchone()
 
     reqs = con.execute("""
@@ -1253,7 +1202,7 @@ def finance_settlement():
     con = db()
 
     row = con.execute(
-        "SELECT balance FROM platform_account WHERE id=1"
+        "SELECT balance FROM platform_wallet WHERE id=1"
     ).fetchone()
 
     balance = float(row[0] if row else 0)
@@ -1276,7 +1225,7 @@ def finance_settlement():
     """,(amount,holder,account,ifsc,bank,ref))
 
     con.execute(
-        "UPDATE platform_account SET balance=balance-? WHERE id=1",
+        "UPDATE platform_wallet SET balance=balance-? WHERE id=1",
         (amount,)
     )
 
@@ -1479,230 +1428,6 @@ def legacy_admin_requests():
     con.close()
     return jsonify({"ok": True, "requests": [dict(x) for x in rows]})
 
-
-# ===== SPIN123 FINAL FINANCE / VIP / PLATFORM EXTENSION =====
-def _spin123_final_init():
-    con = db()
-    con.executescript("""
-    CREATE TABLE IF NOT EXISTS platform_account(
-        id INTEGER PRIMARY KEY CHECK(id=1),
-        balance REAL NOT NULL DEFAULT 0
-    );
-    INSERT OR IGNORE INTO platform_account(id,balance) VALUES(1,0);
-
-    CREATE TABLE IF NOT EXISTS platform_ledger(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        type TEXT NOT NULL,
-        amount REAL NOT NULL,
-        balance_after REAL NOT NULL,
-        note TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS pool_ledger(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        total_pool REAL NOT NULL,
-        player_share REAL NOT NULL,
-        platform_share REAL NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-    con.commit()
-    con.close()
-
-_spin123_final_init()
-
-@app.route("/api/refund", methods=["POST"])
-@app.route("/refund", methods=["POST"])
-@app.route("/legacy/refund", methods=["POST"])
-def spin123_refund_request():
-    player = api_player()
-    if not player:
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    data = request.get_json(silent=True) or request.form or {}
-    try:
-        amount = int(data.get("amount", 0))
-    except Exception:
-        amount = 0
-    if amount <= 0:
-        return jsonify({"ok": False, "error": "Invalid amount"}), 400
-    con = db()
-    cur = con.execute(
-        """INSERT INTO money_requests(player_id,type,amount,status)
-           VALUES(?,'Refund',?,'Pending')""",
-        (player["id"], amount)
-    )
-    con.commit()
-    rid = cur.lastrowid
-    con.close()
-    return jsonify({"ok": True, "request_id": rid, "type": "Refund", "status": "Pending"})
-
-@app.route("/api/admin/refund/<int:req_id>/approve", methods=["POST"])
-def spin123_refund_approve(req_id):
-    if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    con = db()
-    row = con.execute(
-        """SELECT id,player_id,amount,status FROM money_requests
-           WHERE id=? AND type='Refund'""", (req_id,)
-    ).fetchone()
-    if not row:
-        con.close()
-        return jsonify({"ok": False, "error": "Refund request not found"}), 404
-    if row["status"] != "Pending":
-        con.close()
-        return jsonify({"ok": False, "error": "Already processed"}), 400
-
-    con.execute("UPDATE money_requests SET status='Approved' WHERE id=?", (req_id,))
-    con.execute("UPDATE players SET balance=balance+? WHERE id=?", (row["amount"], row["player_id"]))
-    try:
-        con.execute(
-            """INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
-               VALUES(?,'Refund',?,'Approved',?)""",
-            (row["player_id"], row["amount"], f"REFUND-{req_id}")
-        )
-    except Exception:
-        pass
-    con.commit()
-    con.close()
-    return jsonify({"ok": True, "request_id": req_id, "status": "Approved"})
-
-@app.route("/api/admin/refund/<int:req_id>/reject", methods=["POST"])
-def spin123_refund_reject(req_id):
-    if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    con = db()
-    con.execute(
-        """UPDATE money_requests SET status='Rejected'
-           WHERE id=? AND type='Refund' AND status='Pending'""", (req_id,)
-    )
-    con.commit()
-    con.close()
-    return jsonify({"ok": True, "request_id": req_id, "status": "Rejected"})
-
-@app.route("/api/vip", methods=["GET"])
-@app.route("/vip", methods=["GET"])
-@app.route("/legacy/vip", methods=["GET"])
-def spin123_vip():
-    player = api_player()
-    if not player:
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    return jsonify({
-        "ok": True,
-        "vip": player["vip"],
-        "level": player["vip"],
-        "player_id": player["id"]
-    })
-
-@app.route("/api/admin/player/<int:player_id>/vip", methods=["POST"])
-def spin123_set_vip(player_id):
-    if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    data = request.get_json(silent=True) or request.form or {}
-    vip = str(data.get("vip", "Normal")).strip() or "Normal"
-    con = db()
-    con.execute("UPDATE players SET vip=? WHERE id=?", (vip, player_id))
-    con.commit()
-    con.close()
-    return jsonify({"ok": True, "player_id": player_id, "vip": vip})
-
-@app.route("/payment-config", methods=["GET"])
-@app.route("/legacy/payment-config", methods=["GET"])
-@app.route("/legacy/payment-settings", methods=["GET"])
-def spin123_payment_config():
-    return api_payment_settings()
-
-@app.route("/api/admin/pool/split", methods=["POST"])
-def spin123_pool_split():
-    """Transparent accounting only: 60% player pool, 40% platform share."""
-    if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    data = request.get_json(silent=True) or request.form or {}
-    try:
-        total = float(data.get("total_pool", 0))
-    except Exception:
-        total = 0
-    if total < 0:
-        return jsonify({"ok": False, "error": "Invalid total_pool"}), 400
-
-    player_share = round(total * 0.60, 2)
-    platform_share = round(total * 0.40, 2)
-
-    con = db()
-    con.execute(
-        "INSERT INTO pool_ledger(total_pool,player_share,platform_share) VALUES(?,?,?)",
-        (total, player_share, platform_share)
-    )
-    con.execute("UPDATE platform_account SET balance=balance+? WHERE id=1", (platform_share,))
-    bal = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()[0]
-    con.execute(
-        """INSERT INTO platform_ledger(type,amount,balance_after,note)
-           VALUES('PoolShare',?,?,?)""",
-        (platform_share, bal, f"40% platform share from pool {total}")
-    )
-    con.commit()
-    con.close()
-    return jsonify({
-        "ok": True,
-        "total_pool": total,
-        "player_share_60": player_share,
-        "platform_share_40": platform_share,
-        "platform_balance": bal
-    })
-
-@app.route("/api/admin/platform-account", methods=["GET"])
-def spin123_platform_account():
-    if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    con = db()
-    bal = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()[0]
-    rows = con.execute(
-        """SELECT id,type,amount,balance_after,note,created_at
-           FROM platform_ledger ORDER BY id DESC LIMIT 200"""
-    ).fetchall()
-    con.close()
-    return jsonify({"ok": True, "balance": bal, "ledger": [dict(r) for r in rows]})
-
-@app.route("/api/admin/platform-withdraw", methods=["POST"])
-def spin123_platform_withdraw():
-    """Admin platform balance may intentionally go negative; ledger always records it."""
-    if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    data = request.get_json(silent=True) or request.form or {}
-    try:
-        amount = float(data.get("amount", 0))
-    except Exception:
-        amount = 0
-    if amount <= 0:
-        return jsonify({"ok": False, "error": "Invalid amount"}), 400
-
-    note = str(data.get("note", "")).strip()
-    con = db()
-    con.execute("UPDATE platform_account SET balance=balance-? WHERE id=1", (amount,))
-    bal = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()[0]
-    con.execute(
-        """INSERT INTO platform_ledger(type,amount,balance_after,note)
-           VALUES('AdminWithdraw',?,?,?)""",
-        (-amount, bal, note)
-    )
-    con.commit()
-    con.close()
-    return jsonify({"ok": True, "withdrawn": amount, "platform_balance": bal})
-
-@app.route("/api/admin/pool/history", methods=["GET"])
-def spin123_pool_history():
-    if not session.get("admin"):
-        return jsonify({"ok": False, "error": "Unauthorized"}), 401
-    con = db()
-    rows = con.execute(
-        """SELECT id,total_pool,player_share,platform_share,created_at
-           FROM pool_ledger ORDER BY id DESC LIMIT 200"""
-    ).fetchall()
-    con.close()
-    return jsonify({"ok": True, "rows": [dict(r) for r in rows]})
-# ===== END SPIN123 FINAL EXTENSION =====
-
-
 # Capture only unmatched requests. We keep the original 404 behavior,
 # so the probe cannot accidentally make an unsupported API look successful.
 @app.errorhandler(404)
@@ -1718,1118 +1443,282 @@ def legacy_probe_404(err):
 _legacy_ensure_tables()
 # ===== END LEGACY / PROBE BRIDGE =====
 
-# ===== PLAYERS AUTH SCHEMA MIGRATION =====
-def migrate_players_auth_schema():
-    con = db()
-    cols = {r["name"] for r in con.execute("PRAGMA table_info(players)").fetchall()}
-
-    if "password_hash" not in cols:
-        con.execute("ALTER TABLE players ADD COLUMN password_hash TEXT")
-
-    if "token" not in cols:
-        con.execute("ALTER TABLE players ADD COLUMN token TEXT")
-
-    if "created_at" not in cols:
-        con.execute("ALTER TABLE players ADD COLUMN created_at TEXT")
-
-    con.commit()
-    con.close()
-
-migrate_players_auth_schema()
-# ===== END PLAYERS AUTH SCHEMA MIGRATION =====
 
 
-# ===== MONEY REQUESTS SCHEMA FIX =====
-def migrate_money_requests():
-    con = db()
+# ============================================================
+# Spin123 client compatibility bridge
+# Account / wallet / manual payment-request flows only.
+# No betting/wager settlement or result-control logic.
+# ============================================================
+import secrets as _compat_secrets
+import time as _compat_time
 
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS money_requests(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            amount INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'Pending',
-            reference TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cols = {
-        r["name"]
-        for r in con.execute("PRAGMA table_info(money_requests)").fetchall()
-    }
-
-    if "reference" not in cols:
-        con.execute(
-            "ALTER TABLE money_requests ADD COLUMN reference TEXT DEFAULT ''"
-        )
-
-    if "created_at" not in cols:
-        con.execute(
-            "ALTER TABLE money_requests ADD COLUMN created_at TEXT"
-        )
-
-    con.commit()
-    con.close()
-
-migrate_money_requests()
-# ===== END MONEY REQUESTS SCHEMA FIX =====
-
-
-# ===== FINANCE PAGE SCHEMA FIX =====
-def migrate_finance_schema():
-    con = db()
-
-    # money_requests के Finance/Withdraw fields
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS money_requests(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            player_id INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            amount INTEGER NOT NULL DEFAULT 0,
-            status TEXT NOT NULL DEFAULT 'Pending',
-            reference TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cols = {
-        r["name"]
-        for r in con.execute("PRAGMA table_info(money_requests)").fetchall()
-    }
-
-    missing = {
-        "account_holder": "TEXT DEFAULT ''",
-        "account_number": "TEXT DEFAULT ''",
-        "ifsc": "TEXT DEFAULT ''",
-        "bank_name": "TEXT DEFAULT ''",
-        "reference": "TEXT DEFAULT ''",
-        "created_at": "TEXT"
-    }
-
-    for name, definition in missing.items():
-        if name not in cols:
-            con.execute(
-                f"ALTER TABLE money_requests ADD COLUMN {name} {definition}"
-            )
-
-    # Admin/Platform settlement history
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS admin_settlements(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            amount REAL NOT NULL DEFAULT 0,
-            account_holder TEXT DEFAULT '',
-            account_number TEXT DEFAULT '',
-            ifsc TEXT DEFAULT '',
-            bank_name TEXT DEFAULT '',
-            status TEXT DEFAULT 'Completed',
-            reference TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    con.commit()
-    con.close()
-
-migrate_finance_schema()
-# ===== END FINANCE PAGE SCHEMA FIX =====
-
-
-
-# ===== SPIN123 COMPLETE PAYMENT FLOW =====
-import hmac as _spin_hmac
-import hashlib as _spin_hashlib
-import time as _spin_time
-import json as _spin_json
-import urllib.parse as _spin_urlparse
-import html as _spin_html
-
-def _spin123_payment_schema_v2():
-    con = db()
-
-    con.executescript("""
-    CREATE TABLE IF NOT EXISTS payment_events(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        event_id TEXT UNIQUE NOT NULL,
-        player_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        utr TEXT UNIQUE,
-        provider_status TEXT NOT NULL,
-        credited INTEGER NOT NULL DEFAULT 0,
-        raw_payload TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS admin_direct_credits(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        player_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        note TEXT DEFAULT '',
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    """)
-
-    cols = {r["name"] for r in con.execute("PRAGMA table_info(money_requests)").fetchall()}
-    additions = {
-        "utr": "TEXT DEFAULT ''",
-        "provider_status": "TEXT DEFAULT 'Pending'",
-        "payment_token": "TEXT DEFAULT ''",
-        "verified_at": "TEXT DEFAULT ''",
-        "provider_event_id": "TEXT DEFAULT ''",
-    }
-    for name, definition in additions.items():
-        if name not in cols:
-            con.execute(f"ALTER TABLE money_requests ADD COLUMN {name} {definition}")
-
-    con.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_money_requests_utr
-        ON money_requests(utr)
-        WHERE utr IS NOT NULL AND trim(utr) <> ''
-    """)
-    con.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_money_requests_payment_token
-        ON money_requests(payment_token)
-        WHERE payment_token IS NOT NULL AND trim(payment_token) <> ''
-    """)
-    con.commit()
-    con.close()
-
-_spin123_payment_schema_v2()
-
-def _spin123_webhook_secret():
-    return os.environ.get("PAYMENT_WEBHOOK_SECRET", "").encode()
-
-def _spin123_sig_message(data, extended=False):
-    fields = [
-        str(data.get("event_id", "")),
-        str(data.get("user_id", "")),
-        str(data.get("amount", "")),
-        str(data.get("utr", "")),
-        str(data.get("status", "")),
-        str(data.get("timestamp", "")),
-    ]
-    if extended:
-        fields.append(str(data.get("request_id", "")))
-    return "|".join(fields).encode()
-
-def _spin123_verify_signature(data, supplied):
-    secret = _spin123_webhook_secret()
-    if not secret or not supplied:
-        return False
-    candidates = [
-        _spin_hmac.new(secret, _spin123_sig_message(data, False), _spin_hashlib.sha256).hexdigest(),
-        _spin_hmac.new(secret, _spin123_sig_message(data, True), _spin_hashlib.sha256).hexdigest(),
-    ]
-    return any(_spin_hmac.compare_digest(x, supplied) for x in candidates)
-
-def _spin123_success_status(status):
-    return str(status or "").upper() in {"SUCCESS", "SUCCESSFUL", "PAID", "COMPLETED", "VERIFIED"}
-
-def _spin123_credit_request(con, req, utr, event_id):
-    """Credit exactly once. Caller must be inside BEGIN IMMEDIATE transaction."""
-    fresh = con.execute(
-        "SELECT id,player_id,amount,status,utr FROM money_requests WHERE id=?",
-        (req["id"],)
-    ).fetchone()
-    if not fresh:
-        return False, "Request not found"
-
-    if fresh["status"] == "Approved":
-        return False, "Already credited"
-    if fresh["status"] != "Pending":
-        return False, "Request is not pending"
-
-    con.execute(
-        "UPDATE players SET balance=balance+? WHERE id=?",
-        (fresh["amount"], fresh["player_id"])
-    )
-    con.execute("""
-        UPDATE money_requests
-        SET status='Approved',
-            utr=?,
-            reference=?,
-            provider_status='Verified',
-            verified_at=CURRENT_TIMESTAMP,
-            provider_event_id=?
-        WHERE id=? AND status='Pending'
-    """, (utr, utr, event_id, fresh["id"]))
-
+def _compat_payload():
+    data = {}
     try:
-        con.execute("""
-            INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
-            VALUES(?,'Deposit',?,'Approved',?)
-        """, (fresh["player_id"], fresh["amount"], utr))
+        if request.is_json:
+            j = request.get_json(silent=True) or {}
+            if isinstance(j, dict):
+                data.update(j)
     except Exception:
         pass
-    return True, "Credited"
-
-def _spin123_select_payment_config(amount):
-    con = db()
-    rr = con.execute("""
-        SELECT min_amount,max_amount,upi_id,qr_url,account_name,note
-        FROM qr_ranges
-        WHERE enabled=1 AND ? BETWEEN min_amount AND max_amount
-        ORDER BY min_amount ASC LIMIT 1
-    """, (amount,)).fetchone()
-
-    if rr and (rr["upi_id"] or rr["qr_url"]):
-        cfg = dict(rr)
-    else:
-        row = con.execute(
-            "SELECT upi_id,qr_url,account_name,note FROM payment_settings WHERE id=1"
-        ).fetchone()
-        cfg = dict(row) if row else {
-            "upi_id":"", "qr_url":"", "account_name":"", "note":""
-        }
-    con.close()
-    return cfg
-
-def _spin123_upi_links(upi_id, account_name, amount, request_id):
-    params = {
-        "pa": upi_id,
-        "pn": account_name or "Spin123",
-        "am": f"{float(amount):.2f}",
-        "cu": "INR",
-        "tn": f"Spin123 Deposit #{request_id}",
-        "tr": f"SPIN123-{request_id}",
-    }
-    query = _spin_urlparse.urlencode(params)
-    upi_uri = "upi://pay?" + query
-
-    def intent(package_name):
-        return (
-            "intent://pay?" + query +
-            "#Intent;scheme=upi;package=" + package_name + ";end"
-        )
-
-    return {
-        "upi_uri": upi_uri,
-        "google_pay": intent("com.google.android.apps.nbu.paisa.user"),
-        "phonepe": intent("com.phonepe.app"),
-        "paytm": intent("net.one97.paytm"),
-    }
-
-def _spin123_validate_utr(utr):
-    utr = str(utr or "").strip().upper()
-    if not (6 <= len(utr) <= 40):
-        return ""
-    if not all(c.isalnum() or c in "-_" for c in utr):
-        return ""
-    return utr
-
-@app.route("/api/deposit/prepare", methods=["POST"])
-def spin123_deposit_prepare():
-    player = api_player()
-    if not player:
-        return jsonify({"ok":False,"error":"Unauthorized"}),401
-
-    data = request.get_json(silent=True) or request.form or {}
     try:
-        amount = int(data.get("amount", 0))
+        data.update(request.form.to_dict())
+    except Exception:
+        pass
+    try:
+        for k, v in request.args.items():
+            data.setdefault(k, v)
+    except Exception:
+        pass
+    return data
+
+def _compat_ensure_tables():
+    con = db()
+    con.execute("""CREATE TABLE IF NOT EXISTS compat_users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        token TEXT,
+        phone TEXT,
+        balance REAL NOT NULL DEFAULT 0,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS compat_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        amount REAL NOT NULL,
+        method_id TEXT,
+        status TEXT NOT NULL DEFAULT 'Pending',
+        created_at INTEGER NOT NULL
+    )""")
+    con.commit()
+    con.close()
+
+_compat_ensure_tables()
+
+def _compat_user(token=None, uid=None):
+    con = db()
+    row = None
+    if token:
+        row = con.execute("SELECT * FROM compat_users WHERE token=?", (token,)).fetchone()
+    elif uid is not None:
+        row = con.execute("SELECT * FROM compat_users WHERE id=?", (uid,)).fetchone()
+    con.close()
+    return row
+
+def _compat_config(row):
+    base = request.host_url.rstrip("/")
+    return {
+        "code": 200,
+        "uid": row["id"],
+        "user": row["username"],
+        "token": row["token"],
+        "coin": row["balance"],
+        "balance": row["balance"],
+        "diamond": 0,
+        "pts": 0,
+        "levelexp": 0,
+        "payapi": base,
+        "payurl": base + "/order/pay",
+        "drawurl": base + "/draw/order",
+        "transaction": base + "/transaction",
+        "payment": base + "/payment"
+    }
+
+@app.route("/api/register", methods=["POST"])
+@app.route("/register", methods=["POST"])
+def compat_register():
+    p = _compat_payload()
+    username = str(p.get("user") or p.get("username") or p.get("phone") or "").strip()
+    password = str(p.get("passwd") or p.get("password") or "")
+    if not username or not password:
+        return jsonify({"code":400,"msg":"user/password required"}), 400
+    con = db()
+    if con.execute("SELECT 1 FROM compat_users WHERE username=?", (username,)).fetchone():
+        con.close()
+        return jsonify({"code":409,"msg":"user exists"}), 409
+    token = _compat_secrets.token_urlsafe(32)
+    con.execute("INSERT INTO compat_users(username,password,token,phone,created_at) VALUES(?,?,?,?,?)",
+                (username,password,token,p.get("phone"),int(_compat_time.time())))
+    con.commit()
+    row = con.execute("SELECT * FROM compat_users WHERE username=?", (username,)).fetchone()
+    con.close()
+    return jsonify(_compat_config(row))
+
+@app.route("/api/login", methods=["POST"])
+@app.route("/legacy/login", methods=["POST"])
+@app.route("/user/login", methods=["POST"])
+def compat_login():
+    p = _compat_payload()
+    username = str(p.get("user") or p.get("username") or p.get("phone") or "").strip()
+    password = str(p.get("passwd") or p.get("password") or "")
+    con = db()
+    row = con.execute("SELECT * FROM compat_users WHERE username=? AND password=?",
+                      (username,password)).fetchone()
+    if not row:
+        con.close()
+        return jsonify({"code":401,"msg":"invalid credentials"}), 401
+    if not row["enabled"]:
+        con.close()
+        return jsonify({"code":403,"msg":"player disabled"}), 403
+    token = _compat_secrets.token_urlsafe(32)
+    con.execute("UPDATE compat_users SET token=? WHERE id=?", (token,row["id"]))
+    con.commit()
+    row = con.execute("SELECT * FROM compat_users WHERE id=?", (row["id"],)).fetchone()
+    con.close()
+    return jsonify(_compat_config(row))
+
+@app.route("/wallet")
+@app.route("/balance")
+@app.route("/api/wallet")
+@app.route("/user/balance")
+def compat_wallet():
+    p = _compat_payload()
+    row = _compat_user(p.get("token"), p.get("uid"))
+    if not row:
+        return jsonify({"code":401,"msg":"invalid token"}), 401
+    return jsonify({"code":200,"uid":row["id"],"coin":row["balance"],"balance":row["balance"],
+                    "diamond":0,"pts":0,"levelexp":0})
+
+@app.route("/index/config")
+def compat_index_config():
+    base = request.host_url.rstrip("/")
+    return jsonify({"code":200,"payapi":base,"payurl":base+"/order/pay",
+                    "drawurl":base+"/draw/order","transaction":base+"/transaction",
+                    "payment":base+"/payment"})
+
+@app.route("/order/pay", methods=["POST"])
+@app.route("/deposit", methods=["POST"])
+@app.route("/api/deposit", methods=["POST"])
+def compat_deposit():
+    p = _compat_payload()
+    row = _compat_user(p.get("token"), p.get("uid"))
+    if not row:
+        return jsonify({"code":401,"msg":"invalid token"}), 401
+    try:
+        amount = float(p.get("amount") or p.get("coin") or p.get("money") or 0)
     except Exception:
         amount = 0
     if amount <= 0:
-        return jsonify({"ok":False,"error":"Invalid amount"}),400
-
-    cfg = _spin123_select_payment_config(amount)
-    if not cfg.get("upi_id") and not cfg.get("qr_url"):
-        return jsonify({"ok":False,"error":"Payment QR/UPI is not configured"}),503
-
-    token = secrets.token_urlsafe(24)
+        return jsonify({"code":400,"msg":"invalid amount"}), 400
+    method = p.get("payment_id") or p.get("id") or p.get("method_id")
     con = db()
-    cur = con.execute("""
-        INSERT INTO money_requests(
-            player_id,type,amount,status,reference,utr,
-            provider_status,payment_token
-        )
-        VALUES(?,'Deposit',?,'Pending','','','Pending',?)
-    """, (player["id"], amount, token))
-    request_id = cur.lastrowid
-    con.commit()
-    con.close()
-
-    links = _spin123_upi_links(
-        cfg.get("upi_id",""),
-        cfg.get("account_name",""),
-        amount,
-        request_id
-    )
-    payment_url = request.host_url.rstrip("/") + "/pay/" + token
-
-    return jsonify({
-        "ok": True,
-        "request_id": request_id,
-        "status": "Pending",
-        "payment_url": payment_url,
-        "amount": amount,
-        "upi_id": cfg.get("upi_id",""),
-        "account_name": cfg.get("account_name",""),
-        "qr_url": cfg.get("qr_url",""),
-        "note": cfg.get("note",""),
-        "upi": links
-    })
-
-def _spin123_submit_utr_for_request(req_id, player_id, utr):
-    utr = _spin123_validate_utr(utr)
-    if not utr:
-        return {"ok":False,"error":"Invalid UTR"},400
-
-    con = db()
+    cur = con.execute("""INSERT INTO compat_requests(uid,username,kind,amount,method_id,status,created_at)
+                         VALUES(?,?,?,?,?,'Pending',?)""",
+                      (row["id"],row["username"],"Deposit",amount,method,int(_compat_time.time())))
+    # Mirror into existing admin payments table so /payments can see it.
     try:
-        con.execute("BEGIN IMMEDIATE")
-        req = con.execute("""
-            SELECT id,player_id,amount,status,utr
-            FROM money_requests
-            WHERE id=? AND type='Deposit'
-        """, (req_id,)).fetchone()
-
-        if not req or int(req["player_id"]) != int(player_id):
-            con.rollback(); con.close()
-            return {"ok":False,"error":"Deposit request not found"},404
-
-        if req["status"] == "Approved":
-            bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()[0]
-            con.rollback(); con.close()
-            return {"ok":True,"status":"Approved","credited":True,"balance":bal},200
-
-        duplicate = con.execute("""
-            SELECT id,player_id FROM money_requests
-            WHERE utr=? AND id<>?
-        """, (utr, req_id)).fetchone()
-        if duplicate:
-            con.rollback(); con.close()
-            return {"ok":False,"error":"UTR already used"},409
-
-        con.execute("""
-            UPDATE money_requests
-            SET utr=?, reference=?, provider_status='Pending'
-            WHERE id=?
-        """, (utr, utr, req_id))
-
-        event = con.execute("""
-            SELECT id,event_id,player_id,amount,provider_status,credited
-            FROM payment_events
-            WHERE utr=?
-        """, (utr,)).fetchone()
-
-        credited = False
-        if (event and _spin123_success_status(event["provider_status"])
-                and int(event["player_id"]) == int(player_id)
-                and float(event["amount"]) == float(req["amount"])):
-            credited, _ = _spin123_credit_request(con, req, utr, event["event_id"])
-            if credited:
-                con.execute("UPDATE payment_events SET credited=1 WHERE id=?", (event["id"],))
-
-        con.commit()
-        bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()[0]
-        state = con.execute(
-            "SELECT status,provider_status FROM money_requests WHERE id=?",
-            (req_id,)
-        ).fetchone()
-        con.close()
-
-        return {
-            "ok":True,
-            "request_id":req_id,
-            "utr":utr,
-            "status":state["status"],
-            "provider_status":state["provider_status"],
-            "credited":bool(credited),
-            "balance":bal
-        },200
-    except sqlite3.IntegrityError:
-        con.rollback(); con.close()
-        return {"ok":False,"error":"UTR already used"},409
-    except Exception as e:
-        con.rollback(); con.close()
-        return {"ok":False,"error":str(e)},500
-
-@app.route("/api/deposit/<int:req_id>/utr", methods=["POST"])
-def spin123_submit_utr(req_id):
-    player = api_player()
-    if not player:
-        return jsonify({"ok":False,"error":"Unauthorized"}),401
-    data = request.get_json(silent=True) or request.form or {}
-    result, code = _spin123_submit_utr_for_request(req_id, player["id"], data.get("utr",""))
-    return jsonify(result), code
-
-@app.route("/api/deposit/<int:req_id>/status", methods=["GET"])
-def spin123_deposit_status(req_id):
-    player = api_player()
-    if not player:
-        return jsonify({"ok":False,"error":"Unauthorized"}),401
-    con = db()
-    row = con.execute("""
-        SELECT id,amount,status,utr,provider_status,verified_at
-        FROM money_requests WHERE id=? AND player_id=? AND type='Deposit'
-    """, (req_id, player["id"])).fetchone()
-    con.close()
-    if not row:
-        return jsonify({"ok":False,"error":"Deposit request not found"}),404
-    return jsonify({"ok":True, **dict(row)})
-
-@app.route("/pay/<token>", methods=["GET"])
-def spin123_payment_page(token):
-    con = db()
-    req = con.execute("""
-        SELECT m.id,m.player_id,m.amount,m.status,m.utr,m.provider_status,
-               p.username
-        FROM money_requests m
-        LEFT JOIN players p ON p.id=m.player_id
-        WHERE m.payment_token=? AND m.type='Deposit'
-    """, (token,)).fetchone()
-    con.close()
-    if not req:
-        return page("<div class=card>Payment request not found.</div>"),404
-
-    cfg = _spin123_select_payment_config(req["amount"])
-    links = _spin123_upi_links(
-        cfg.get("upi_id",""),
-        cfg.get("account_name",""),
-        req["amount"],
-        req["id"]
-    )
-    qr = cfg.get("qr_url","")
-    qr_html = (
-        f'<img src="{_spin_html.escape(qr, quote=True)}" '
-        'style="width:240px;max-width:85%;border-radius:14px;background:white;padding:8px">'
-        if qr else ""
-    )
-    safe_upi = _spin_html.escape(cfg.get("upi_id",""))
-    safe_name = _spin_html.escape(cfg.get("account_name",""))
-    safe_token = _spin_html.escape(token, quote=True)
-    safe_gpay = _spin_html.escape(links["google_pay"], quote=True)
-    safe_phonepe = _spin_html.escape(links["phonepe"], quote=True)
-    safe_paytm = _spin_html.escape(links["paytm"], quote=True)
-    safe_upi_uri = _spin_html.escape(links["upi_uri"], quote=True)
-
-    return page(f"""
-    <div class=card style="text-align:center">
-      <h2>Deposit ₹{req['amount']}</h2>
-      <p>User: {_spin_html.escape(str(req['username'] or req['player_id']))}</p>
-      {qr_html}
-      <p><b>{safe_name}</b><br>{safe_upi}</p>
-
-      <a href="{safe_gpay}"><button>Google Pay</button></a>
-      <a href="{safe_phonepe}"><button>PhonePe</button></a>
-      <a href="{safe_paytm}"><button>Paytm</button></a>
-      <br>
-      <a href="{safe_upi_uri}"><button>Other UPI App</button></a>
-
-      <hr style="margin:18px 0;border-color:#24364d">
-      <p>Payment complete होने के बाद UTR डालें.</p>
-      <form method=post action="/pay/{safe_token}/utr">
-        <input name=utr placeholder="UTR / Transaction ID" required>
-        <button>Verify Payment</button>
-      </form>
-      <p id=status>Current status: {_spin_html.escape(str(req['status']))}</p>
-    </div>
-    <script>
-    async function refreshStatus(){{
-      try {{
-        const r=await fetch("/pay/{safe_token}/status");
-        const j=await r.json();
-        if(j.ok){{
-          document.getElementById("status").innerText =
-            "Status: " + j.status + " / " + j.provider_status;
-          if(j.status==="Approved"){{
-            document.getElementById("status").innerText =
-              "✅ Payment Successful - Wallet credited";
-          }}
-        }}
-      }} catch(e) {{}}
-    }}
-    document.addEventListener("visibilitychange",()=>{{
-      if(!document.hidden) refreshStatus();
-    }});
-    setInterval(refreshStatus,5000);
-    </script>
-    """)
-
-@app.route("/pay/<token>/utr", methods=["POST"])
-def spin123_payment_page_submit_utr(token):
-    con = db()
-    req = con.execute(
-        "SELECT id,player_id FROM money_requests WHERE payment_token=? AND type='Deposit'",
-        (token,)
-    ).fetchone()
-    con.close()
-    if not req:
-        return page("<div class=card>Payment request not found.</div>"),404
-
-    result, code = _spin123_submit_utr_for_request(
-        req["id"], req["player_id"], request.form.get("utr","")
-    )
-    if result.get("credited"):
-        msg = "✅ Payment verified. Wallet credited successfully."
-    elif result.get("ok"):
-        msg = "⏳ UTR saved. Provider verification pending."
-    else:
-        msg = "❌ " + _spin_html.escape(str(result.get("error","Request failed")))
-    return page(
-        f'<div class=card><h3>{msg}</h3>'
-        f'<a href="/pay/{_spin_html.escape(token, quote=True)}"><button>Back</button></a></div>'
-    ), code
-
-@app.route("/pay/<token>/status", methods=["GET"])
-def spin123_payment_page_status(token):
-    con = db()
-    row = con.execute("""
-        SELECT id,amount,status,provider_status,verified_at
-        FROM money_requests WHERE payment_token=? AND type='Deposit'
-    """, (token,)).fetchone()
-    con.close()
-    if not row:
-        return jsonify({"ok":False,"error":"Not found"}),404
-    return jsonify({"ok":True, **dict(row)})
-
-@app.route("/api/payment/webhook", methods=["POST"])
-def spin123_payment_webhook():
-    data = request.get_json(silent=True) or {}
-    sig = request.headers.get("X-Spin123-Signature", "").strip()
-
-    if not _spin123_verify_signature(data, sig):
-        return jsonify({"ok":False,"error":"Invalid webhook signature"}),401
-
-    try:
-        event_id = str(data["event_id"]).strip()
-        player_id = int(data["user_id"])
-        amount = float(data["amount"])
-        utr = _spin123_validate_utr(data.get("utr",""))
-        status = str(data.get("status","")).strip().upper()
-        ts = int(data.get("timestamp",0))
-        request_id = int(data.get("request_id",0) or 0)
+        con.execute("INSERT INTO payments(player,type,amount,status) VALUES(?,?,?,'Pending')",
+                    (row["username"],"Deposit",amount))
     except Exception:
-        return jsonify({"ok":False,"error":"Invalid payload"}),400
-
-    if not event_id or amount <= 0 or not utr:
-        return jsonify({"ok":False,"error":"Missing/invalid event_id, amount or UTR"}),400
-    if ts and abs(int(_spin_time.time()) - ts) > 900:
-        return jsonify({"ok":False,"error":"Stale webhook"}),400
-
-    con = db()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-
-        existing = con.execute(
-            "SELECT id,credited,provider_status FROM payment_events WHERE event_id=? OR utr=?",
-            (event_id, utr)
-        ).fetchone()
-        if existing:
-            con.rollback(); con.close()
-            return jsonify({
-                "ok":True,
-                "duplicate":True,
-                "credited":bool(existing["credited"]),
-                "status":existing["provider_status"]
-            })
-
-        player = con.execute("SELECT id FROM players WHERE id=?", (player_id,)).fetchone()
-        if not player:
-            con.rollback(); con.close()
-            return jsonify({"ok":False,"error":"Unknown user_id"}),404
-
-        con.execute("""
-            INSERT INTO payment_events(
-                event_id,player_id,amount,utr,provider_status,credited,raw_payload
-            ) VALUES(?,?,?,?,?,?,?)
-        """, (
-            event_id, player_id, amount, utr, status, 0,
-            _spin_json.dumps(data, separators=(",",":"))
-        ))
-
-        req = None
-        if request_id:
-            req = con.execute("""
-                SELECT id,player_id,amount,status,utr
-                FROM money_requests
-                WHERE id=? AND type='Deposit' AND player_id=? AND amount=?
-            """, (request_id, player_id, amount)).fetchone()
-
-        if not req:
-            req = con.execute("""
-                SELECT id,player_id,amount,status,utr
-                FROM money_requests
-                WHERE type='Deposit' AND player_id=? AND amount=? AND utr=?
-                ORDER BY id DESC LIMIT 1
-            """, (player_id, amount, utr)).fetchone()
-
-        if not req:
-            candidates = con.execute("""
-                SELECT id,player_id,amount,status,utr
-                FROM money_requests
-                WHERE type='Deposit' AND player_id=? AND amount=? AND status='Pending'
-                ORDER BY id DESC LIMIT 2
-            """, (player_id, amount)).fetchall()
-            if len(candidates) == 1:
-                req = candidates[0]
-
-        credited = False
-        if req and _spin123_success_status(status):
-            credited, _ = _spin123_credit_request(con, req, utr, event_id)
-            if credited:
-                con.execute(
-                    "UPDATE payment_events SET credited=1 WHERE event_id=?",
-                    (event_id,)
-                )
-        elif req:
-            con.execute("""
-                UPDATE money_requests
-                SET utr=?,reference=?,provider_status=?
-                WHERE id=? AND status='Pending'
-            """, (utr, utr, status or "Pending", req["id"]))
-
-        con.commit()
-        bal = con.execute("SELECT balance FROM players WHERE id=?", (player_id,)).fetchone()[0]
-        con.close()
-        return jsonify({
-            "ok":True,
-            "event_id":event_id,
-            "user_id":player_id,
-            "utr":utr,
-            "provider_status":status,
-            "matched_request_id": req["id"] if req else None,
-            "credited":bool(credited),
-            "balance":bal
-        })
-    except sqlite3.IntegrityError:
-        con.rollback(); con.close()
-        return jsonify({"ok":True,"duplicate":True,"credited":False}),200
-    except Exception as e:
-        con.rollback(); con.close()
-        return jsonify({"ok":False,"error":str(e)}),500
-
-@app.route("/api/admin/direct-credit", methods=["POST"])
-def spin123_admin_direct_credit():
-    if not session.get("admin"):
-        return jsonify({"ok":False,"error":"Unauthorized"}),401
-
-    data = request.get_json(silent=True) or request.form or {}
-    try:
-        player_id = int(data.get("user_id",0))
-        amount = float(data.get("amount",0))
-    except Exception:
-        return jsonify({"ok":False,"error":"Invalid user_id/amount"}),400
-
-    note = str(data.get("note","")).strip()
-    if player_id <= 0 or amount <= 0:
-        return jsonify({"ok":False,"error":"Invalid user_id/amount"}),400
-
-    con = db()
-    try:
-        con.execute("BEGIN IMMEDIATE")
-        player = con.execute(
-            "SELECT id,username,balance FROM players WHERE id=?",
-            (player_id,)
-        ).fetchone()
-        if not player:
-            con.rollback(); con.close()
-            return jsonify({"ok":False,"error":"Player not found"}),404
-
-        con.execute("UPDATE players SET balance=balance+? WHERE id=?", (amount, player_id))
-        con.execute("UPDATE platform_account SET balance=balance-? WHERE id=1", (amount,))
-        platform_balance = con.execute(
-            "SELECT balance FROM platform_account WHERE id=1"
-        ).fetchone()[0]
-
-        con.execute(
-            "INSERT INTO admin_direct_credits(player_id,amount,note) VALUES(?,?,?)",
-            (player_id, amount, note)
-        )
-        con.execute("""
-            INSERT INTO platform_ledger(type,amount,balance_after,note)
-            VALUES('DirectPlayerCredit',?,?,?)
-        """, (-amount, platform_balance, note or f"Direct credit to player {player_id}"))
         try:
-            con.execute("""
-                INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
-                VALUES(?,'AdminCredit',?,'Approved',?)
-            """, (player_id, amount, note or "ADMIN-DIRECT-CREDIT"))
+            con.execute("INSERT INTO payments(player,type,amount) VALUES(?,?,?)",
+                        (row["username"],"Deposit",amount))
         except Exception:
             pass
-
-        con.commit()
-        balance = con.execute(
-            "SELECT balance FROM players WHERE id=?", (player_id,)
-        ).fetchone()[0]
-        con.close()
-        return jsonify({
-            "ok":True,
-            "user_id":player_id,
-            "credited":amount,
-            "balance":balance,
-            "platform_balance":platform_balance
-        })
-    except Exception as e:
-        con.rollback(); con.close()
-        return jsonify({"ok":False,"error":str(e)}),500
-
-@app.route("/admin/direct-credit", methods=["GET","POST"])
-def spin123_admin_direct_credit_page():
-    if not session.get("admin"):
-        return redirect("/login")
-
-    message = ""
-    if request.method == "POST":
-        data = request.form
-        try:
-            player_id = int(data.get("user_id",0))
-            amount = float(data.get("amount",0))
-        except Exception:
-            player_id, amount = 0, 0
-
-        note = str(data.get("note","")).strip()
-        if player_id > 0 and amount > 0:
-            con = db()
-            try:
-                con.execute("BEGIN IMMEDIATE")
-                player = con.execute(
-                    "SELECT id,username FROM players WHERE id=?", (player_id,)
-                ).fetchone()
-                if not player:
-                    message = "❌ Player not found"
-                    con.rollback()
-                else:
-                    con.execute("UPDATE players SET balance=balance+? WHERE id=?", (amount,player_id))
-                    con.execute("UPDATE platform_account SET balance=balance-? WHERE id=1",(amount,))
-                    pbal = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()[0]
-                    con.execute(
-                        "INSERT INTO admin_direct_credits(player_id,amount,note) VALUES(?,?,?)",
-                        (player_id,amount,note)
-                    )
-                    con.execute("""
-                        INSERT INTO platform_ledger(type,amount,balance_after,note)
-                        VALUES('DirectPlayerCredit',?,?,?)
-                    """,(-amount,pbal,note or f"Direct credit to player {player_id}"))
-                    try:
-                        con.execute("""
-                            INSERT INTO wallet_transactions(player_id,type,amount,status,reference)
-                            VALUES(?,'AdminCredit',?,'Approved',?)
-                        """,(player_id,amount,note or "ADMIN-DIRECT-CREDIT"))
-                    except Exception:
-                        pass
-                    con.commit()
-                    message = f"✅ ₹{amount:.2f} credited to User ID {player_id}"
-            except Exception as e:
-                con.rollback()
-                message = "❌ " + _spin_html.escape(str(e))
-            finally:
-                con.close()
-        else:
-            message = "❌ Valid User ID and amount required"
-
-    con = db()
-    bal = con.execute("SELECT balance FROM platform_account WHERE id=1").fetchone()
-    rows = con.execute("""
-        SELECT d.id,d.player_id,p.username,d.amount,d.note,d.created_at
-        FROM admin_direct_credits d
-        LEFT JOIN players p ON p.id=d.player_id
-        ORDER BY d.id DESC LIMIT 100
-    """).fetchall()
-    con.close()
-
-    history = ""
-    for r in rows:
-        history += (
-            f"<tr><td>{r['id']}</td><td>{r['player_id']}</td>"
-            f"<td>{_spin_html.escape(str(r['username'] or ''))}</td>"
-            f"<td>₹{float(r['amount']):.2f}</td>"
-            f"<td>{_spin_html.escape(str(r['note'] or ''))}</td>"
-            f"<td>{_spin_html.escape(str(r['created_at'] or ''))}</td></tr>"
-        )
-
-    return page(f"""
-      <div class=card>
-        <h2>Admin Direct User Credit</h2>
-        <p>Platform balance: ₹{float(bal[0] if bal else 0):.2f}</p>
-        <p>{message}</p>
-        <form method=post>
-          <input name=user_id type=number min=1 placeholder="User ID" required>
-          <input name=amount type=number min=1 step=0.01 placeholder="Amount" required>
-          <input name=note placeholder="Note / Reference">
-          <button>Credit User Wallet</button>
-        </form>
-      </div>
-      <div class=card>
-        <h3>Direct Credit History</h3>
-        <div style="overflow:auto"><table>
-          <tr><th>ID</th><th>User ID</th><th>Player</th><th>Amount</th><th>Note</th><th>Created</th></tr>
-          {history}
-        </table></div>
-      </div>
-    """)
-
-@app.route("/api/admin/payment-events", methods=["GET"])
-def spin123_admin_payment_events():
-    if not session.get("admin"):
-        return jsonify({"ok":False,"error":"Unauthorized"}),401
-    con = db()
-    rows = con.execute("""
-        SELECT id,event_id,player_id,amount,utr,provider_status,credited,created_at
-        FROM payment_events ORDER BY id DESC LIMIT 500
-    """).fetchall()
-    con.close()
-    return jsonify({"ok":True,"rows":[dict(r) for r in rows]})
-# ===== END SPIN123 COMPLETE PAYMENT FLOW =====
-
-
-
-
-# ===== SPIN123 COMPLETE PLAYER <-> ADMIN SUPPORT CHAT =====
-from werkzeug.utils import secure_filename
-from flask import send_from_directory
-import uuid as _support_uuid
-import html as _support_html
-
-SUPPORT_UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "support_uploads")
-os.makedirs(SUPPORT_UPLOAD_DIR, exist_ok=True)
-SUPPORT_ALLOWED_EXT = {"png","jpg","jpeg","webp","pdf","txt","doc","docx","xls","xlsx"}
-SUPPORT_MAX_FILE = 5 * 1024 * 1024
-
-def _support_init():
-    con=db()
-    con.executescript("""
-    CREATE TABLE IF NOT EXISTS support_messages(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        player_id INTEGER NOT NULL,
-        sender TEXT NOT NULL,
-        topic TEXT DEFAULT 'Other',
-        request_ref TEXT DEFAULT '',
-        utr TEXT DEFAULT '',
-        amount REAL,
-        message TEXT DEFAULT '',
-        attachment_name TEXT DEFAULT '',
-        attachment_path TEXT DEFAULT '',
-        attachment_mime TEXT DEFAULT '',
-        is_read INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-    CREATE INDEX IF NOT EXISTS idx_support_player_id ON support_messages(player_id,id);
-    """)
-    con.commit(); con.close()
-
-_support_init()
-
-def _support_save_upload(file_obj):
-    if not file_obj or not getattr(file_obj, "filename", ""):
-        return "", "", ""
-    original = secure_filename(file_obj.filename)
-    if not original or "." not in original:
-        raise ValueError("Unsupported attachment")
-    ext = original.rsplit(".",1)[1].lower()
-    if ext not in SUPPORT_ALLOWED_EXT:
-        raise ValueError("Unsupported attachment type")
-    data = file_obj.read(SUPPORT_MAX_FILE + 1)
-    if len(data) > SUPPORT_MAX_FILE:
-        raise ValueError("Attachment maximum 5 MB")
-    stored = f"{_support_uuid.uuid4().hex}.{ext}"
-    path = os.path.join(SUPPORT_UPLOAD_DIR, stored)
-    with open(path, "wb") as f:
-        f.write(data)
-    return original, stored, (getattr(file_obj, "mimetype", "") or "application/octet-stream")
-
-@app.route("/api/support/messages", methods=["GET","POST"])
-def spin123_player_support_messages():
-    player=api_player()
-    if not player:
-        return jsonify({"ok":False,"error":"Unauthorized"}),401
-
-    if request.method=="GET":
-        con=db()
-        rows=con.execute("""
-            SELECT id,sender,topic,request_ref,utr,amount,message,
-                   attachment_name,attachment_path,attachment_mime,is_read,created_at
-            FROM support_messages WHERE player_id=? ORDER BY id ASC LIMIT 500
-        """,(player["id"],)).fetchall()
-        con.execute("UPDATE support_messages SET is_read=1 WHERE player_id=? AND sender='admin'",(player["id"],))
-        con.commit(); con.close()
-        data=[]
-        for r in rows:
-            x=dict(r)
-            x["attachment_url"] = (f"/api/support/attachment/{r['id']}" if r["attachment_path"] else "")
-            x.pop("attachment_path",None)
-            data.append(x)
-        return jsonify({"ok":True,"messages":data})
-
-    payload=request.get_json(silent=True) if request.is_json else request.form
-    payload=payload or {}
-    topic=str(payload.get("topic","Other")).strip() or "Other"
-    allowed_topics={"Deposit","Withdraw","Refund","Wallet","QR/UPI","VIP","Login/Account","Game Issue","Other"}
-    if topic not in allowed_topics:
-        topic="Other"
-    message=str(payload.get("message","")).strip()
-    request_ref=str(payload.get("request_ref","")).strip()[:120]
-    utr=str(payload.get("utr","")).strip()[:120]
-    try:
-        amount=float(payload.get("amount")) if str(payload.get("amount","")).strip() else None
-    except Exception:
-        amount=None
-
-    aname=apath=amime=""
-    try:
-        if not request.is_json:
-            aname,apath,amime=_support_save_upload(request.files.get("attachment"))
-    except ValueError as e:
-        return jsonify({"ok":False,"error":str(e)}),400
-
-    if not message and not apath:
-        return jsonify({"ok":False,"error":"Message or attachment required"}),400
-
-    con=db()
-    cur=con.execute("""
-        INSERT INTO support_messages(
-            player_id,sender,topic,request_ref,utr,amount,message,
-            attachment_name,attachment_path,attachment_mime,is_read
-        ) VALUES(?,'player',?,?,?,?,?,?,?,?,0)
-    """,(player["id"],topic,request_ref,utr,amount,message,aname,apath,amime))
-    con.commit(); mid=cur.lastrowid; con.close()
-    return jsonify({"ok":True,"message_id":mid,"status":"Sent"})
-
-@app.route("/api/support/attachment/<int:message_id>", methods=["GET"])
-def spin123_support_attachment(message_id):
-    con=db()
-    row=con.execute("SELECT player_id,attachment_name,attachment_path FROM support_messages WHERE id=?",(message_id,)).fetchone()
-    con.close()
-    if not row or not row["attachment_path"]:
-        return jsonify({"ok":False,"error":"Attachment not found"}),404
-    player=api_player()
-    if not session.get("admin") and (not player or player["id"] != row["player_id"]):
-        return jsonify({"ok":False,"error":"Unauthorized"}),401
-    return send_from_directory(SUPPORT_UPLOAD_DIR,row["attachment_path"],as_attachment=True,download_name=row["attachment_name"])
-
-@app.route("/support/<int:player_id>", methods=["GET","POST"])
-def spin123_admin_support_chat(player_id):
-    if not auth():
-        return redirect("/login")
-    con=db()
-    p=con.execute("SELECT id,username FROM players WHERE id=?",(player_id,)).fetchone()
-    if not p:
-        con.close()
-        return page("<div class=card>Player not found.</div>")
-
-    error=""
-    if request.method=="POST":
-        message=request.form.get("message","").strip()
-        topic=request.form.get("topic","Other").strip() or "Other"
-        request_ref=request.form.get("request_ref","").strip()[:120]
-        utr=request.form.get("utr","").strip()[:120]
-        try:
-            amount=float(request.form.get("amount")) if request.form.get("amount","").strip() else None
-        except Exception:
-            amount=None
-        aname=apath=amime=""
-        try:
-            aname,apath,amime=_support_save_upload(request.files.get("attachment"))
-        except ValueError as e:
-            error=str(e)
-        if not error:
-            if message or apath:
-                con.execute("""
-                    INSERT INTO support_messages(
-                        player_id,sender,topic,request_ref,utr,amount,message,
-                        attachment_name,attachment_path,attachment_mime,is_read
-                    ) VALUES(?,'admin',?,?,?,?,?,?,?,?,0)
-                """,(player_id,topic,request_ref,utr,amount,message,aname,apath,amime))
-                con.commit()
-            else:
-                error="Message or attachment required"
-
-    con.execute("UPDATE support_messages SET is_read=1 WHERE player_id=? AND sender='player'",(player_id,))
     con.commit()
-    rows=con.execute("""
-        SELECT * FROM support_messages WHERE player_id=? ORDER BY id ASC LIMIT 500
-    """,(player_id,)).fetchall()
+    rid = cur.lastrowid
     con.close()
+    return jsonify({"code":200,"orderid":rid,"productid":method,"paymentUrl":None,"status":"Pending"})
 
-    body=f"<div class=card><a href='/support'>← Inbox</a><h2>User ID {p['id']} — {_support_html.escape(str(p['username']))}</h2></div>"
-    if error:
-        body+=f"<div class=card>{_support_html.escape(error)}</div>"
-    body+="<div class=card>"
-    for r in rows:
-        who="PLAYER" if r["sender"]=="player" else "ADMIN"
-        body+=f"<div style='padding:10px;margin:8px 0;background:#0b1728;border-radius:8px'><b>{who} · {_support_html.escape(str(r['topic']))}</b><br>"
-        if r["request_ref"]: body+=f"Ref: {_support_html.escape(str(r['request_ref']))}<br>"
-        if r["utr"]: body+=f"UTR: {_support_html.escape(str(r['utr']))}<br>"
-        if r["amount"] is not None: body+=f"Amount: ₹{r['amount']}<br>"
-        if r["message"]: body+=f"{_support_html.escape(str(r['message']))}<br>"
-        if r["attachment_path"]:
-            body+=f"<a href='/api/support/attachment/{r['id']}'>📎 {_support_html.escape(str(r['attachment_name']))}</a><br>"
-        body+=f"<small>{_support_html.escape(str(r['created_at']))}</small></div>"
-    body+="</div>"
-    body+=f"""
-    <div class=card><h3>Reply</h3>
-    <form method=post enctype="multipart/form-data">
-      <select name=topic>
-        <option>Deposit</option><option>Withdraw</option><option>Refund</option>
-        <option>Wallet</option><option>QR/UPI</option><option>VIP</option>
-        <option>Login/Account</option><option>Game Issue</option><option selected>Other</option>
-      </select>
-      <input name=request_ref placeholder="Request / Reference ID">
-      <input name=utr placeholder="UTR / Transaction ID">
-      <input name=amount type=number step=0.01 placeholder="Amount">
-      <input name=message placeholder="Reply message">
-      <input type=file name=attachment accept=".png,.jpg,.jpeg,.webp,.pdf,.txt,.doc,.docx,.xls,.xlsx">
-      <button>Send Reply</button>
-    </form></div>
-    """
-    return page(body)
+@app.route("/draw/alltypes")
+@app.route("/draw/drawType")
+def compat_draw_types():
+    p = _compat_payload()
+    row = _compat_user(p.get("token"), p.get("uid"))
+    if not row:
+        return jsonify({"code":401,"msg":"invalid token"}), 401
+    con = db()
+    data = []
+    try:
+        rows = con.execute("""SELECT id,min_amount,max_amount,upi_id,qr_url,account_name,note,enabled
+                              FROM qr_ranges WHERE enabled=1 ORDER BY min_amount""").fetchall()
+        for r in rows:
+            data.append({"id":r["id"],"name":r["account_name"] or "UPI",
+                         "min":r["min_amount"],"max":r["max_amount"],
+                         "upi_id":r["upi_id"],"qr_url":r["qr_url"],"note":r["note"]})
+    except Exception:
+        pass
+    con.close()
+    return jsonify({"code":200,"data":data})
 
-@app.route("/api/admin/support/<int:player_id>/messages", methods=["GET"])
-def spin123_admin_support_api(player_id):
-    if not auth():
-        return jsonify({"ok":False,"error":"Unauthorized"}),401
+@app.route("/draw/order", methods=["POST"])
+@app.route("/withdraw", methods=["POST"])
+@app.route("/api/withdraw", methods=["POST"])
+def compat_withdraw():
+    p = _compat_payload()
+    row = _compat_user(p.get("token"), p.get("uid"))
+    if not row:
+        return jsonify({"code":401,"msg":"invalid token"}), 401
+    try:
+        amount = float(p.get("dcoin") or p.get("amount") or 0)
+    except Exception:
+        amount = 0
+    if amount <= 0:
+        return jsonify({"code":400,"msg":"invalid amount"}), 400
+    if float(row["balance"]) < amount:
+        return jsonify({"code":400,"msg":"insufficient balance"}), 400
+    method = p.get("bankid") or p.get("method_id")
+    con = db()
+    cur = con.execute("""INSERT INTO compat_requests(uid,username,kind,amount,method_id,status,created_at)
+                         VALUES(?,?,?,?,?,'Pending',?)""",
+                      (row["id"],row["username"],"Withdrawal",amount,method,int(_compat_time.time())))
+    try:
+        con.execute("INSERT INTO payments(player,type,amount,status) VALUES(?,?,?,'Pending')",
+                    (row["username"],"Withdrawal",amount))
+    except Exception:
+        try:
+            con.execute("INSERT INTO payments(player,type,amount) VALUES(?,?,?)",
+                        (row["username"],"Withdrawal",amount))
+        except Exception:
+            pass
+    con.commit()
+    rid = cur.lastrowid
+    con.close()
+    return jsonify({"code":200,"orderid":rid,"status":"Pending"})
+
+@app.route("/refund", methods=["POST"])
+@app.route("/api/refund", methods=["POST"])
+def compat_refund():
+    p = _compat_payload()
+    row = _compat_user(p.get("token"), p.get("uid"))
+    if not row:
+        return jsonify({"code":401,"msg":"invalid token"}), 401
+    try:
+        amount = float(p.get("amount") or 0)
+    except Exception:
+        amount = 0
+    if amount <= 0:
+        return jsonify({"code":400,"msg":"invalid amount"}), 400
+    con = db()
+    cur = con.execute("""INSERT INTO compat_requests(uid,username,kind,amount,status,created_at)
+                         VALUES(?,?,?,?,'Pending',?)""",
+                      (row["id"],row["username"],"Refund",amount,int(_compat_time.time())))
+    con.commit(); rid=cur.lastrowid; con.close()
+    return jsonify({"code":200,"orderid":rid,"status":"Pending"})
+
+@app.route("/transaction")
+@app.route("/transactions")
+@app.route("/history")
+@app.route("/api/transactions")
+def compat_history():
+    p = _compat_payload()
+    row = _compat_user(p.get("token"), p.get("uid"))
+    if not row:
+        return jsonify({"code":401,"msg":"invalid token"}), 401
     con=db()
-    rows=con.execute("""
-        SELECT id,sender,topic,request_ref,utr,amount,message,
-               attachment_name,attachment_mime,is_read,created_at
-        FROM support_messages WHERE player_id=? ORDER BY id ASC LIMIT 500
-    """,(player_id,)).fetchall()
+    rows=con.execute("""SELECT id,kind,amount,method_id,status,created_at
+                        FROM compat_requests WHERE uid=? ORDER BY id DESC""",(row["id"],)).fetchall()
     con.close()
-    return jsonify({"ok":True,"player_id":player_id,"messages":[dict(r) for r in rows]})
+    return jsonify({"code":200,"data":[dict(x) for x in rows]})
 
-
-# ===== SPIN123 APK SINGLE-ADMIN CONFIG =====
-
-@app.route("/version.manifest", methods=["GET"])
-def spin123_version_manifest():
-    return jsonify({
-        "version": "1.2.1.0",
-        "packageUrl": "http://ifs.168125.com/GameX/1.2.1.0/Main",
-        "remoteVersionUrl": "https://spin123-admin.onrender.com/version.manifest",
-        "remoteManifestUrl": "https://spin123-admin.onrender.com/project.manifest",
-        "androidAppUrl": "https://spin123-admin.onrender.com"
-    })
-
-
-@app.route("/project.manifest", methods=["GET"])
-def spin123_project_manifest():
-    return jsonify({
-        "version": "1.2.1.0",
-        "packageUrl": "http://ifs.168125.com/GameX/1.2.1.0/Main",
-        "remoteVersionUrl": "https://spin123-admin.onrender.com/version.manifest",
-        "remoteManifestUrl": "https://spin123-admin.onrender.com/project.manifest",
-        "androidAppUrl": "https://spin123-admin.onrender.com",
-        "assets": {},
-        "searchPaths": []
-    })
-
-
-@app.route("/api/gamerule", methods=["GET","POST"])
-@app.route("/gamerule", methods=["GET","POST"])
-def spin123_apk_gamerule():
-    return jsonify({
-        "ok": True,
-        "status": 1,
-        "enabled": 1,
-        "maintenance": False,
-        "mode": "normal",
-        "androidAppUrl": "https://spin123-admin.onrender.com",
-        "remoteVersionUrl": "https://spin123-admin.onrender.com/version.manifest",
-        "remoteManifestUrl": "https://spin123-admin.onrender.com/project.manifest"
-    })
-
-# ===== END SPIN123 APK SINGLE-ADMIN CONFIG =====
+@app.route("/payment")
+def compat_payment():
+    return jsonify({"code":200,"payapi":request.host_url.rstrip("/")})
 
 
 if __name__ == "__main__":

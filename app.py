@@ -1,5 +1,5 @@
 import base64
-from flask import Flask, request, redirect, session, render_template_string, jsonify
+from flask import Flask, request, redirect, session, render_template_string
 import sqlite3, os
 
 app = Flask(__name__)
@@ -534,46 +534,98 @@ def api_register():
 
 @app.route("/api/login", methods=["POST"])
 def api_login():
-    data=request.get_json(silent=True) or {}
-    username=str(data.get("username","")).strip()
-    password=str(data.get("password",""))
+    # Compatibility-aware player login.
+    # Accepts both old admin-style JSON/form payloads and Spin123 client aliases.
+    p = {}
+    try:
+        if request.is_json:
+            j = request.get_json(silent=True) or {}
+            if isinstance(j, dict):
+                p.update(j)
+    except Exception:
+        pass
+    try:
+        p.update(request.form.to_dict())
+    except Exception:
+        pass
+    try:
+        for k, v in request.args.items():
+            p.setdefault(k, v)
+    except Exception:
+        pass
 
-    con=db()
-    row=con.execute(
-        "SELECT * FROM players WHERE lower(username)=lower(?)",
-        (username,)
-    ).fetchone()
-
-    if not row or not row["password_hash"] or \
-       not check_password_hash(row["password_hash"],password):
-        con.close()
-        return jsonify({"ok":False,"error":"Invalid login"}),401
-
-    if row["status"] != "Active":
-        con.close()
-        return jsonify({"ok":False,"error":"Account disabled"}),403
-
-    token=secrets.token_urlsafe(32)
-
-    con.execute(
-        "UPDATE players SET token=? WHERE id=?",
-        (token,row["id"])
+    username = str(
+        p.get("user") or p.get("username") or p.get("phone") or ""
+    ).strip()
+    password = str(
+        p.get("passwd") or p.get("password") or ""
     )
-    con.commit()
 
-    player=con.execute(
-        "SELECT id,username,balance,vip,status FROM players WHERE id=?",
-        (row["id"],)
-    ).fetchone()
+    if not username or not password:
+        return jsonify({"ok": False, "code": 400, "error": "user/password required"}), 400
+
+    con = db()
+
+    # First try compatibility player table created by the merged bridge.
+    try:
+        row = con.execute(
+            "SELECT * FROM compat_users WHERE username=? AND password=?",
+            (username, password)
+        ).fetchone()
+    except Exception:
+        row = None
+
+    if row:
+        if not row["enabled"]:
+            con.close()
+            return jsonify({"ok": False, "code": 403, "error": "player disabled"}), 403
+
+        token = _compat_secrets.token_urlsafe(32)
+        con.execute("UPDATE compat_users SET token=? WHERE id=?", (token, row["id"]))
+        con.commit()
+        row = con.execute("SELECT * FROM compat_users WHERE id=?", (row["id"],)).fetchone()
+        con.close()
+
+        base = request.host_url.rstrip("/")
+        return jsonify({
+            "ok": True,
+            "code": 200,
+            "uid": row["id"],
+            "user": row["username"],
+            "token": row["token"],
+            "balance": row["balance"],
+            "coin": row["balance"],
+            "diamond": 0,
+            "pts": 0,
+            "levelexp": 0,
+            "payapi": base,
+            "payurl": base + "/order/pay",
+            "drawurl": base + "/draw/order",
+            "transaction": base + "/transaction",
+            "payment": base + "/payment"
+        })
+
+    # Preserve older admin/player-login behavior when possible.
+    legacy = None
+    try:
+        legacy = con.execute(
+            "SELECT * FROM players WHERE username=?",
+            (username,)
+        ).fetchone()
+    except Exception:
+        legacy = None
 
     con.close()
 
-    return jsonify({
-        "ok":True,
-        "token":token,
-        "player":dict(player)
-    })
+    # Do not guess the old password schema here. Return a clear compatibility login error.
+    if legacy:
+        return jsonify({
+            "ok": False,
+            "code": 401,
+            "error": "legacy account requires existing admin login flow"
+        }), 401
 
+    return jsonify({"ok": False, "code": 401, "error": "Invalid login"}), 401
 
 @app.route("/api/wallet", methods=["GET"])
 def api_wallet():
@@ -1442,284 +1494,6 @@ def legacy_probe_404(err):
 
 _legacy_ensure_tables()
 # ===== END LEGACY / PROBE BRIDGE =====
-
-
-
-# ============================================================
-# Spin123 client compatibility bridge
-# Account / wallet / manual payment-request flows only.
-# No betting/wager settlement or result-control logic.
-# ============================================================
-import secrets as _compat_secrets
-import time as _compat_time
-
-def _compat_payload():
-    data = {}
-    try:
-        if request.is_json:
-            j = request.get_json(silent=True) or {}
-            if isinstance(j, dict):
-                data.update(j)
-    except Exception:
-        pass
-    try:
-        data.update(request.form.to_dict())
-    except Exception:
-        pass
-    try:
-        for k, v in request.args.items():
-            data.setdefault(k, v)
-    except Exception:
-        pass
-    return data
-
-def _compat_ensure_tables():
-    con = db()
-    con.execute("""CREATE TABLE IF NOT EXISTS compat_users(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        token TEXT,
-        phone TEXT,
-        balance REAL NOT NULL DEFAULT 0,
-        enabled INTEGER NOT NULL DEFAULT 1,
-        created_at INTEGER NOT NULL
-    )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS compat_requests(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        uid INTEGER NOT NULL,
-        username TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        amount REAL NOT NULL,
-        method_id TEXT,
-        status TEXT NOT NULL DEFAULT 'Pending',
-        created_at INTEGER NOT NULL
-    )""")
-    con.commit()
-    con.close()
-
-_compat_ensure_tables()
-
-def _compat_user(token=None, uid=None):
-    con = db()
-    row = None
-    if token:
-        row = con.execute("SELECT * FROM compat_users WHERE token=?", (token,)).fetchone()
-    elif uid is not None:
-        row = con.execute("SELECT * FROM compat_users WHERE id=?", (uid,)).fetchone()
-    con.close()
-    return row
-
-def _compat_config(row):
-    base = request.host_url.rstrip("/")
-    return {
-        "code": 200,
-        "uid": row["id"],
-        "user": row["username"],
-        "token": row["token"],
-        "coin": row["balance"],
-        "balance": row["balance"],
-        "diamond": 0,
-        "pts": 0,
-        "levelexp": 0,
-        "payapi": base,
-        "payurl": base + "/order/pay",
-        "drawurl": base + "/draw/order",
-        "transaction": base + "/transaction",
-        "payment": base + "/payment"
-    }
-
-@app.route("/api/register", methods=["POST"])
-@app.route("/register", methods=["POST"])
-def compat_register():
-    p = _compat_payload()
-    username = str(p.get("user") or p.get("username") or p.get("phone") or "").strip()
-    password = str(p.get("passwd") or p.get("password") or "")
-    if not username or not password:
-        return jsonify({"code":400,"msg":"user/password required"}), 400
-    con = db()
-    if con.execute("SELECT 1 FROM compat_users WHERE username=?", (username,)).fetchone():
-        con.close()
-        return jsonify({"code":409,"msg":"user exists"}), 409
-    token = _compat_secrets.token_urlsafe(32)
-    con.execute("INSERT INTO compat_users(username,password,token,phone,created_at) VALUES(?,?,?,?,?)",
-                (username,password,token,p.get("phone"),int(_compat_time.time())))
-    con.commit()
-    row = con.execute("SELECT * FROM compat_users WHERE username=?", (username,)).fetchone()
-    con.close()
-    return jsonify(_compat_config(row))
-
-@app.route("/api/login", methods=["POST"])
-@app.route("/legacy/login", methods=["POST"])
-@app.route("/user/login", methods=["POST"])
-def compat_login():
-    p = _compat_payload()
-    username = str(p.get("user") or p.get("username") or p.get("phone") or "").strip()
-    password = str(p.get("passwd") or p.get("password") or "")
-    con = db()
-    row = con.execute("SELECT * FROM compat_users WHERE username=? AND password=?",
-                      (username,password)).fetchone()
-    if not row:
-        con.close()
-        return jsonify({"code":401,"msg":"invalid credentials"}), 401
-    if not row["enabled"]:
-        con.close()
-        return jsonify({"code":403,"msg":"player disabled"}), 403
-    token = _compat_secrets.token_urlsafe(32)
-    con.execute("UPDATE compat_users SET token=? WHERE id=?", (token,row["id"]))
-    con.commit()
-    row = con.execute("SELECT * FROM compat_users WHERE id=?", (row["id"],)).fetchone()
-    con.close()
-    return jsonify(_compat_config(row))
-
-@app.route("/wallet")
-@app.route("/balance")
-@app.route("/api/wallet")
-@app.route("/user/balance")
-def compat_wallet():
-    p = _compat_payload()
-    row = _compat_user(p.get("token"), p.get("uid"))
-    if not row:
-        return jsonify({"code":401,"msg":"invalid token"}), 401
-    return jsonify({"code":200,"uid":row["id"],"coin":row["balance"],"balance":row["balance"],
-                    "diamond":0,"pts":0,"levelexp":0})
-
-@app.route("/index/config")
-def compat_index_config():
-    base = request.host_url.rstrip("/")
-    return jsonify({"code":200,"payapi":base,"payurl":base+"/order/pay",
-                    "drawurl":base+"/draw/order","transaction":base+"/transaction",
-                    "payment":base+"/payment"})
-
-@app.route("/order/pay", methods=["POST"])
-@app.route("/deposit", methods=["POST"])
-@app.route("/api/deposit", methods=["POST"])
-def compat_deposit():
-    p = _compat_payload()
-    row = _compat_user(p.get("token"), p.get("uid"))
-    if not row:
-        return jsonify({"code":401,"msg":"invalid token"}), 401
-    try:
-        amount = float(p.get("amount") or p.get("coin") or p.get("money") or 0)
-    except Exception:
-        amount = 0
-    if amount <= 0:
-        return jsonify({"code":400,"msg":"invalid amount"}), 400
-    method = p.get("payment_id") or p.get("id") or p.get("method_id")
-    con = db()
-    cur = con.execute("""INSERT INTO compat_requests(uid,username,kind,amount,method_id,status,created_at)
-                         VALUES(?,?,?,?,?,'Pending',?)""",
-                      (row["id"],row["username"],"Deposit",amount,method,int(_compat_time.time())))
-    # Mirror into existing admin payments table so /payments can see it.
-    try:
-        con.execute("INSERT INTO payments(player,type,amount,status) VALUES(?,?,?,'Pending')",
-                    (row["username"],"Deposit",amount))
-    except Exception:
-        try:
-            con.execute("INSERT INTO payments(player,type,amount) VALUES(?,?,?)",
-                        (row["username"],"Deposit",amount))
-        except Exception:
-            pass
-    con.commit()
-    rid = cur.lastrowid
-    con.close()
-    return jsonify({"code":200,"orderid":rid,"productid":method,"paymentUrl":None,"status":"Pending"})
-
-@app.route("/draw/alltypes")
-@app.route("/draw/drawType")
-def compat_draw_types():
-    p = _compat_payload()
-    row = _compat_user(p.get("token"), p.get("uid"))
-    if not row:
-        return jsonify({"code":401,"msg":"invalid token"}), 401
-    con = db()
-    data = []
-    try:
-        rows = con.execute("""SELECT id,min_amount,max_amount,upi_id,qr_url,account_name,note,enabled
-                              FROM qr_ranges WHERE enabled=1 ORDER BY min_amount""").fetchall()
-        for r in rows:
-            data.append({"id":r["id"],"name":r["account_name"] or "UPI",
-                         "min":r["min_amount"],"max":r["max_amount"],
-                         "upi_id":r["upi_id"],"qr_url":r["qr_url"],"note":r["note"]})
-    except Exception:
-        pass
-    con.close()
-    return jsonify({"code":200,"data":data})
-
-@app.route("/draw/order", methods=["POST"])
-@app.route("/withdraw", methods=["POST"])
-@app.route("/api/withdraw", methods=["POST"])
-def compat_withdraw():
-    p = _compat_payload()
-    row = _compat_user(p.get("token"), p.get("uid"))
-    if not row:
-        return jsonify({"code":401,"msg":"invalid token"}), 401
-    try:
-        amount = float(p.get("dcoin") or p.get("amount") or 0)
-    except Exception:
-        amount = 0
-    if amount <= 0:
-        return jsonify({"code":400,"msg":"invalid amount"}), 400
-    if float(row["balance"]) < amount:
-        return jsonify({"code":400,"msg":"insufficient balance"}), 400
-    method = p.get("bankid") or p.get("method_id")
-    con = db()
-    cur = con.execute("""INSERT INTO compat_requests(uid,username,kind,amount,method_id,status,created_at)
-                         VALUES(?,?,?,?,?,'Pending',?)""",
-                      (row["id"],row["username"],"Withdrawal",amount,method,int(_compat_time.time())))
-    try:
-        con.execute("INSERT INTO payments(player,type,amount,status) VALUES(?,?,?,'Pending')",
-                    (row["username"],"Withdrawal",amount))
-    except Exception:
-        try:
-            con.execute("INSERT INTO payments(player,type,amount) VALUES(?,?,?)",
-                        (row["username"],"Withdrawal",amount))
-        except Exception:
-            pass
-    con.commit()
-    rid = cur.lastrowid
-    con.close()
-    return jsonify({"code":200,"orderid":rid,"status":"Pending"})
-
-@app.route("/refund", methods=["POST"])
-@app.route("/api/refund", methods=["POST"])
-def compat_refund():
-    p = _compat_payload()
-    row = _compat_user(p.get("token"), p.get("uid"))
-    if not row:
-        return jsonify({"code":401,"msg":"invalid token"}), 401
-    try:
-        amount = float(p.get("amount") or 0)
-    except Exception:
-        amount = 0
-    if amount <= 0:
-        return jsonify({"code":400,"msg":"invalid amount"}), 400
-    con = db()
-    cur = con.execute("""INSERT INTO compat_requests(uid,username,kind,amount,status,created_at)
-                         VALUES(?,?,?,?,'Pending',?)""",
-                      (row["id"],row["username"],"Refund",amount,int(_compat_time.time())))
-    con.commit(); rid=cur.lastrowid; con.close()
-    return jsonify({"code":200,"orderid":rid,"status":"Pending"})
-
-@app.route("/transaction")
-@app.route("/transactions")
-@app.route("/history")
-@app.route("/api/transactions")
-def compat_history():
-    p = _compat_payload()
-    row = _compat_user(p.get("token"), p.get("uid"))
-    if not row:
-        return jsonify({"code":401,"msg":"invalid token"}), 401
-    con=db()
-    rows=con.execute("""SELECT id,kind,amount,method_id,status,created_at
-                        FROM compat_requests WHERE uid=? ORDER BY id DESC""",(row["id"],)).fetchall()
-    con.close()
-    return jsonify({"code":200,"data":[dict(x) for x in rows]})
-
-@app.route("/payment")
-def compat_payment():
-    return jsonify({"code":200,"payapi":request.host_url.rstrip("/")})
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
